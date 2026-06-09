@@ -1,0 +1,59 @@
+# ──────────────────────────────────────────────────────────────────────
+# Cox回归生存预测配置文件
+# 使用方法: python run_cox.py                   (默认读取本文件)
+#          python run_cox.py --config xxx.yml  (指定配置文件)
+# ──────────────────────────────────────────────────────────────────────
+
+# ======================== 数据路径 ========================
+
+# 临床表路径（prepare_dfs.py 输出的 _withDFS.xlsx）
+clinical_dir: 'D:\Datas of lab\crc\临床表\CRC_stage2\匹配特征后'
+
+# 统一 eligible 表目录（含 chemo 列，用于亚组分析）
+eligible_dir: 'D:\Datas of lab\crc\临床表\CRC_stage2'
+hmu_clinical: 'HMU_stage2_化疗_匹配特征_withDFS.xlsx'
+wenfu_clinical: '温附一_cohort1+2_stage2_化疗_匹配特征_withDFS.xlsx'
+fujian_clinical: '福建协和_stage2_化疗_匹配特征_withDFS.xlsx'
+
+# CONCH 特征文件目录（.pth格式，每个文件含 feats[N,512] + coords[N,2]）
+feat_base: 'D:\Datas of lab\crc\特征\CONCH\重命名'
+hmu_feat: '哈医大_CONCH特征_CLAM_5X_pth_stage2_renamed'
+wenfu_feat: '温附一_CONCH特征_CLAM_5X_pth_stage2_renamed'
+fujian_feat: '福建协和_CONCH特征_CLAM_5X_pth_stage2_renamed'
+
+# 输出目录
+output_dir: 'cox_output'
+
+# ======================== 模型架构 ========================
+
+D_feat: 512         # 输入特征维度 (CONCH=512, UNI=1024, MUSK=2048, UNI2=1536)
+D_inner: 256        # 隐层维度 (CONCH D_feat=512 → 降维至 256)
+D_attn: 64          # 注意力维度
+
+# ACMIL 特定参数
+n_token: 1          # 注意力分支数量 (1: 大幅减少CoxHead数量 6→2)
+n_masked_patch: 0   # 训练时随机掩蔽的 top-K 实例数量 (0: 小样本下关闭掩蔽减少随机性)
+mask_drop: 0.6      # 掩蔽比例
+droprate: 0.2       # Dropout率 (轻度正则化，避免过度丢弃)
+
+# ======================== 训练参数 ========================
+
+lr: 0.0005         # 学习率 5e-4 (配合CosineAnnealing衰减)
+weight_decay: 0.001   # 权重衰减 (增强到1e-3，L2正则抑制过拟合)
+max_epochs: 200     # 最大训练轮数 (增加到200，因为lr很低需要更多epoch)
+patience: 50        # 早停耐心值 (宽裕一些，避免过早终止)
+
+# 损失函数权重
+diff_weight: 0.0    # 注意力多样性正则 (diff_loss) 权重 (n_token=1时diff_loss无意义，设为0)
+sub_weight: 0.0     # 子分支 Cox loss 权重 (n_token=1时sub_loss与slide_loss完全冗余，设为0)
+                    # 总损失 = cox_loss(slide) + sub_weight * mean(cox_loss(token_i)) + diff_weight * diff_loss
+
+# ======================== 数据划分 ========================
+
+val_ratio: 0.3      # HMU 验证集比例 (7:3划分)
+random_state: 74    # 随机种子 (控制数据划分的可重复性)
+
+# ======================== 运行模式 ========================
+
+mode: train         # train: 训练+评估, evaluate: 仅加载模型评估
+checkpoint_path: '' # 仅 evaluate 模式: 指定模型路径

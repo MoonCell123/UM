@@ -1,0 +1,96 @@
+# ════════════════════════════════════════════════════════════════════
+# UVM D3/M3 二分类 —— 病理基础大模型横评配置文件
+#
+# 科学问题 1：预训练病理知识的迁移价值
+#   通用病理基础模型 vs ImageNet 预训练的 ResNet50 基线，
+#   对 UVM（80 例极端罕见肿瘤）的跨组织知识迁移效果如何？
+#
+# 科学问题 2：数据污染对评估公平性的影响
+#   TCGA 预训练模型（自监督阶段已见过这 80 例 UVM 的组织形态）
+#   vs 私有数据预训练模型（从未接触 TCGA-UVM）
+#   两组的性能是否存在系统性差异，是否存在隐性数据泄露效应？
+#
+# 模型分组：
+#   tcga_pretrained: true  → TCGA 预训练（9 个，CTransPath 特征未提取故未列入）
+#   tcga_pretrained: false → 私有数据预训练 or ImageNet 基线（12 个）
+#
+# 使用方法：
+#   python run_benchmark.py                    # 全部 21 个模型
+#   python run_benchmark.py --model uni_v1     # 仅跑指定模型
+# ════════════════════════════════════════════════════════════════════
+
+# ===================== 数据路径 =====================
+clinical_path: 'D:/Datas of lab/UVM/临床表/临床信息表.csv'
+feat_base: 'D:/Datas of lab/UVM/Trident/20x_256px_0px_overlap'
+label_col: 'd3m3'
+
+# ===================== 模型列表 =====================
+# name            : 显示名（汇总表和日志）
+# feat_subdir     : 特征子目录（相对于 feat_base）
+# tcga_pretrained : 预训练数据是否包含 TCGA 全库切片
+#                   true  → 这 80 例 UVM 组织形态已被模型"见过"
+#                   false → 私有临床数据预训练，未接触 TCGA-UVM
+
+models:
+
+  # ── 组 A：TCGA 预训练模型（8 个可用，CTransPath 特征未提取故跳过）──
+  # 自监督预训练使用了 TCGA 全库切片，存在隐性数据泄露风险
+  # 原计划10个：CTransPath（无特征）+ Phikon_v2 + Kaiko(5) + Lunit + Midnight = 9，
+  # 另有 Phikon_v1 / MUSK 待确认分组后补入
+
+  - {name: phikon_v2,    feat_subdir: 'features_phikon_v2',    tcga_pretrained: true}
+  - {name: kaiko-vitl14, feat_subdir: 'features_kaiko-vitl14', tcga_pretrained: true}
+  - {name: kaiko-vitb16, feat_subdir: 'features_kaiko-vitb16', tcga_pretrained: true}
+  - {name: kaiko-vitb8,  feat_subdir: 'features_kaiko-vitb8',  tcga_pretrained: true}
+  - {name: kaiko-vits16, feat_subdir: 'features_kaiko-vits16', tcga_pretrained: true}
+  - {name: kaiko-vits8,  feat_subdir: 'features_kaiko-vits8',  tcga_pretrained: true}
+  - {name: lunit-vits8,  feat_subdir: 'features_lunit-vits8',  tcga_pretrained: true}
+  - {name: midnight12k,  feat_subdir: 'features_midnight12k',  tcga_pretrained: true}
+
+  # ── 组 B：非 TCGA 预训练模型（11 个）───────────────────────────────
+  # 使用医院私有数据集或 ImageNet 预训练，未接触 TCGA-UVM
+
+  - {name: conch_v1,  feat_subdir: 'features_conch_v1',  tcga_pretrained: false}
+  - {name: conch_v15, feat_subdir: 'features_conch_v15', tcga_pretrained: false}
+  - {name: uni_v1,    feat_subdir: 'features_uni_v1',    tcga_pretrained: false}
+  - {name: uni_v2,    feat_subdir: 'features_uni_v2',    tcga_pretrained: false}
+  - {name: virchow,   feat_subdir: 'features_virchow',   tcga_pretrained: false}
+  - {name: virchow2,  feat_subdir: 'features_virchow2',  tcga_pretrained: false}
+  - {name: gigapath,  feat_subdir: 'features_gigapath',  tcga_pretrained: false}
+  - {name: hoptimus0, feat_subdir: 'features_hoptimus0', tcga_pretrained: false}
+  - {name: hoptimus1, feat_subdir: 'features_hoptimus1', tcga_pretrained: false}
+  - {name: hibou_l,   feat_subdir: 'features_hibou_l',   tcga_pretrained: false}
+  - {name: resnet50,  feat_subdir: 'features_resnet50',  tcga_pretrained: false}
+
+  # ── 待确认分组 ────────────────────────────────────────────────────
+  # Phikon v1: iBOT on TCGA → 预训练数据包含 TCGA，但用户选择归入私有组
+  # MUSK: 预训练数据来源未完全确认
+  # group_confirmed: false 标记，供 analyze_results.py 识别
+  - {name: phikon,    feat_subdir: 'features_phikon',    tcga_pretrained: false, group_confirmed: false}
+  - {name: musk,      feat_subdir: 'features_musk',      tcga_pretrained: false, group_confirmed: false}
+
+# ===================== 分类设置 =====================
+n_classes: 2
+
+# ===================== MIL 聚合架构 =====================
+# n_token=1 时 ACMIL 退化为标准 ABMIL（适合 80 例小样本）
+# D_feat 自动从 h5 检测，D_inner = D_feat // 2
+D_attn: 128
+droprate: 0.25
+n_token: 1          # 1 = ABMIL 模式；5 = 完整 ACMIL（多分支多样性正则）
+n_masked_patch: 10
+mask_drop: 0.6
+
+# ===================== 训练参数 =====================
+lr: 0.0001
+weight_decay: 0.001
+max_epochs: 100
+patience: 20
+accum_steps: 1      # 1 = 每个 WSI 即更新（无梯度累积）
+
+# ===================== 交叉验证 =====================
+n_folds: 5
+random_state: 42
+
+# ===================== 输出目录 =====================
+output_dir: 'benchmark_output'
