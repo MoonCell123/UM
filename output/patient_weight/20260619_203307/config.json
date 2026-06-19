@@ -1,0 +1,38 @@
+{
+  "feat_base": "L:\\20x_256px_0px_overlap",
+  "feature_dirs": [
+    "features_conch_v1",
+    "features_conch_v15",
+    "features_gigapath",
+    "features_hibou_l",
+    "features_hoptimus0",
+    "features_hoptimus1",
+    "features_kaiko-vitb16",
+    "features_kaiko-vitb8",
+    "features_kaiko-vitl14",
+    "features_kaiko-vits16",
+    "features_kaiko-vits8",
+    "features_lunit-vits8",
+    "features_midnight12k",
+    "features_musk",
+    "features_phikon",
+    "features_phikon_v2",
+    "features_uni_v1",
+    "features_uni_v2",
+    "features_virchow",
+    "features_virchow2"
+  ],
+  "patients": [
+    "TCGA-RZ-AB0B-01",
+    "TCGA-V3-A9ZX-01",
+    "TCGA-V3-A9ZY-01"
+  ],
+  "expected_model_count": 20,
+  "hidden_dim": 64,
+  "dropout": 0.0,
+  "checkpoint": null,
+  "seed": 42,
+  "device": "cpu",
+  "input_dim": 34,
+  "untrained_mlp": true
+}
