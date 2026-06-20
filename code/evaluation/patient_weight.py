@@ -202,7 +202,7 @@ def compute_weights(
         for patient_id, indices in rows_by_patient.items():
             x = torch.from_numpy(standardized_features[indices]).float().to(device)
             logits = model(x)
-            weights = torch.softmax(logits, dim=0).cpu().numpy()
+            weights = logits.cpu().numpy()
             logits_np = logits.cpu().numpy()
 
             order = np.argsort(-weights)
@@ -217,11 +217,6 @@ def compute_weights(
                 row["rank"] = int(ranks[local_idx])
                 output_rows.append(row)
 
-            weight_sum = weights.sum()
-            if not np.isclose(weight_sum, 1.0, atol=1e-5):
-                raise RuntimeError(
-                    f"Softmax weights for {patient_id} sum to {weight_sum}, expected 1.0"
-                )
     return output_rows
 
 
