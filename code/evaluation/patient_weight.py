@@ -32,11 +32,8 @@ import torch.nn as nn
 
 
 DEFAULT_FEAT_BASE = r"L:\20x_256px_0px_overlap"
-DEFAULT_PATIENT_IDS = (
-    "TCGA-RZ-AB0B-01",
-    "TCGA-V3-A9ZX-01",
-    "TCGA-V3-A9ZY-01",
-)
+
+DEFAULT_PATIENT_IDS = []
 FEATURE_KEYS = ("feats", "features")
 
 
@@ -57,6 +54,13 @@ class PatientWeightMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)
 
+
+def get_patient_name():
+    cur_dir = r"L:\20x_256px_0px_overlap\features_conch_v1"
+    for filename in os.listdir(cur_dir):
+        if filename.endswith(".h5"):
+            pure_name = os.path.splitext(filename)[0]
+            DEFAULT_PATIENT_IDS.append(pure_name)
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
@@ -190,6 +194,7 @@ def compute_weights(
     model.eval()
     rows_by_patient: Dict[str, List[int]] = {}
     for idx, row in enumerate(rows):
+        print("Start tackle " + str(row["patient_id"]))
         rows_by_patient.setdefault(str(row["patient_id"]), []).append(idx)
 
     output_rows: List[Dict[str, object]] = []
@@ -372,4 +377,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    get_patient_name()
     main()
