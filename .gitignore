@@ -1,3 +1,5 @@
 __pycache__/
 *.png
 .*/
+idea.md
+output/Projected_Embeddings_512/
