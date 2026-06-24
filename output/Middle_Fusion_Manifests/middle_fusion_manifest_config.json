@@ -1,0 +1,13 @@
+{
+  "feat_base": "L:\\20x_256px_0px_overlap",
+  "feature_dirs": [
+    "features_hoptimus1",
+    "features_virchow",
+    "features_hoptimus0"
+  ],
+  "cv_folds": 5,
+  "seed": 42,
+  "slide_source": "intersection of .h5 names in selected features_* directories",
+  "projection_policy": "trainable ProjectionHead is used inside the model and optimized by classification loss",
+  "common_slide_count": 80
+}
