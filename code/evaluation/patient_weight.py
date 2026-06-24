@@ -1,11 +1,6 @@
 """
 Compute patient-specific model weights from feature embeddings.
 
-For each features_* directory under L:\\20x_256px_0px_overlap, this script reads
-three fixed TCGA-UVM h5 files, builds a patient-level feature representation,
-computes model scores with an MLP, applies softmax across models per patient,
-and saves the weight distribution to the project output directory.
-
 Notes:
     - The MLP is not trained in this script. Pass --checkpoint for meaningful
       learned weights. Without a checkpoint, a fixed random seed is used so the
@@ -138,10 +133,6 @@ def _safe_stats(values: np.ndarray) -> List[float]:
 def build_patient_feature(features: np.ndarray) -> np.ndarray:
     """
     Convert variable-size patch embeddings [N, D] into a fixed-length vector.
-
-    Different foundation models can have different D, so this script uses
-    dimension-agnostic summary statistics instead of feeding raw embeddings
-    directly into a shared MLP.
     """
     n_patches, feat_dim = features.shape
     pooled_mean = features.mean(axis=0)
@@ -311,7 +302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.0, help="MLP dropout.")
     parser.add_argument("--checkpoint", default=None, help="Optional trained MLP checkpoint.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed used when no checkpoint is provided.")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="Device for MLP inference.")
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"], help="Device for MLP inference.")
     return parser.parse_args()
 
 
