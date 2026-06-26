@@ -1,0 +1,41 @@
+# Config for code/train/train_offline_fusion_baselines.py
+
+manifest: "output/Middle_Fusion_Manifests/middle_fusion_manifest.csv"
+build_manifest: false
+feat_base: "L:/20x_256px_0px_overlap"
+feature_dirs:
+  - "features_hoptimus1"
+  - "features_virchow"
+  - "features_hoptimus0"
+manifest_dir: "output/Middle_Fusion_Manifests"
+cv_folds: 5
+
+clinical_path: "CHANGE_ME_clinical.csv"
+output_dir: "output/Offline_Fusion_Baselines"
+experiment_name: "offline_fusion_baselines"
+label_col: "d3m3"
+methods:
+  - "all"
+single_encoders: null
+folds: null
+seed: 42
+device: "cuda"
+
+target_dim: 512
+projection_dropout: 0.0
+cross_attn_heads: 4
+cross_attn_layers: 1
+d_inner: 256
+d_attn: 128
+droprate: 0.25
+n_classes: 2
+
+max_epochs: 100
+patience: 20
+lr: 0.0001
+weight_decay: 0.001
+grad_clip: 5.0
+threshold: 0.5
+
+max_patches: 0
+eval_max_patches: 0
