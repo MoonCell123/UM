@@ -382,7 +382,55 @@ Pillow>=10.0.0
 python-docx>=1.0.0
 PyYAML>=6.0
 ```
+## 十一、端到端训练脚本
+流程是：
 
+5-fold manifest
+↓
+每一折：
+  Stage 1:
+    raw embedding
+    ↓
+    ProjectionHead
+    ↓
+    临时 mean fusion + ABMIL
+    ↓
+    用分类 loss 训练 ProjectionHead
+
+  Stage 2:
+    只继承 ProjectionHead
+    重新初始化 Router + ABMIL
+    freeze ProjectionHead
+    ↓
+    train split -> projected embedding -> build static Beacon
+    ↓
+    对每个 WSI:
+      Projection
+      ↓
+      Beacon similarity
+      ↓
+      Intervention attribution
+      ↓
+      Routing 计算 final weight
+      ↓
+      final fusion
+      ↓
+      ABMIL
+    ↓
+    输出 AUC / AUPRC / Sensitivity / Specificity
+
+对应代码位置：
+
+- Projection：`GMEModel.project()`，在 [train_gme.py]
+- Similarity：`similarity_scores()`，在 [train_gme.py]
+- Attribution：`intervention_attribution()`，在 [train_gme.py]
+- Routing + final fusion：`route_with_scores()` 和 `forward_stage2()`，在 [train_gme.py]、[train_gme.py]
+- Build static Beacon：`build_beacon_and_baselines()`，在 [train_gme.py]
+- Freeze projection：在 [train_gme.py]
+- 5-fold loop：在 [train_gme.py]
+
+python code\train\train_gme.py --config code\config\gme.yml
+python code\train\train_offline_fusion_baselines.py --config code\config\offline_fusion_baselines.yml
 ---
 
 > **注意**：代码中的硬编码绝对路径（如 `D:\Datas of lab\...`）为原始实验环境所用。在新环境中，请通过 `config/benchmark.yml`、`config/cox.yml` 等配置文件修改路径，**请勿直接修改 Python 代码**。
