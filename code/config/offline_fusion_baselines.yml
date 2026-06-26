@@ -10,7 +10,7 @@ feature_dirs:
 manifest_dir: "output/Middle_Fusion_Manifests"
 cv_folds: 5
 
-clinical_path: "CHANGE_ME_clinical.csv"
+clinical_path: "G:/Fanglun/Project/UM/clinical_information.csv"
 output_dir: "output/Offline_Fusion_Baselines"
 experiment_name: "offline_fusion_baselines"
 label_col: "d3m3"
