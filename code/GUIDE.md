@@ -431,6 +431,15 @@ PyYAML>=6.0
 
 python code\train\train_gme.py --config code\config\gme.yml
 python code\train\train_offline_fusion_baselines.py --config code\config\offline_fusion_baselines.yml
+
+## 多卡协同训练
+跑GME方法：
+python code\train\launch_fold_parallel.py --config code\config\fold_parallel.yml
+同时写好 fold_parallel.yml 和 gme.yml
+
+跑对照实验：
+python code\train\launch_fold_parallel.py --config code\config\fold_parallel_offline.yml
+同时写好 fold_parallel.yml 和 offline_fusion_baselines.yml
 ---
 
 > **注意**：代码中的硬编码绝对路径（如 `D:\Datas of lab\...`）为原始实验环境所用。在新环境中，请通过 `config/benchmark.yml`、`config/cox.yml` 等配置文件修改路径，**请勿直接修改 Python 代码**。

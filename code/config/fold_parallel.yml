@@ -1,0 +1,27 @@
+# Config for code/train/launch_fold_parallel.py
+# This default launcher runs train_gme.py across two GPUs by fold.
+
+target: "gme"
+train_config: "code/config/gme.yml"
+gpus:
+  - "0"
+  - "1"
+folds:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+split_mode: "contiguous"
+experiment_name: null
+output_dir: null
+launch_output_dir: "output/Fold_Parallel"
+python: null
+dry_run: false
+
+# Extra args passed to the target training script.
+# Examples:
+#   extra_args: "--max-patches 5000"
+#   extra_args:
+#     - "--skip-routing-lambda-analysis"
+extra_args: []
