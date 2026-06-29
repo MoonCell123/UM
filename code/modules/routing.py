@@ -35,10 +35,15 @@ def _logit_from_probability(value: float, eps: float = 1e-6) -> float:
     return float(torch.logit(torch.tensor(value)).item())
 
 
-def zscore_over_encoders(scores: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Normalize scores over the encoder dimension, i.e. the last dimension."""
-    mean = scores.mean(dim=-1, keepdim=True)
-    std = scores.std(dim=-1, keepdim=True, unbiased=False)
+def zscore_with_global_stats(
+    scores: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Normalize scores with train-set-level scalar statistics."""
+    mean = mean.to(device=scores.device, dtype=scores.dtype)
+    std = std.to(device=scores.device, dtype=scores.dtype)
     return (scores - mean) / std.clamp_min(eps)
 
 
@@ -161,6 +166,37 @@ class DualConsistencyRouter(nn.Module):
         self.eps = float(eps)
         self.theta = nn.Parameter(torch.tensor(float(theta_init)))
         self.gamma_logit = nn.Parameter(torch.tensor(_logit_from_probability(gamma_init)))
+        self.register_buffer("attribution_mean", torch.tensor(0.0))
+        self.register_buffer("attribution_std", torch.tensor(1.0))
+        self.register_buffer("similarity_mean", torch.tensor(0.0))
+        self.register_buffer("similarity_std", torch.tensor(1.0))
+        self.register_buffer("score_stats_count", torch.tensor(0, dtype=torch.long))
+
+    def set_score_stats(
+        self,
+        attribution_mean: torch.Tensor | float,
+        attribution_std: torch.Tensor | float,
+        similarity_mean: torch.Tensor | float,
+        similarity_std: torch.Tensor | float,
+        count: int,
+    ) -> None:
+        """Store train-set-level statistics used to standardize routing scores."""
+        device = self.attribution_mean.device
+        self.attribution_mean.copy_(torch.as_tensor(attribution_mean, device=device, dtype=self.attribution_mean.dtype))
+        self.attribution_std.copy_(torch.as_tensor(attribution_std, device=device, dtype=self.attribution_std.dtype).clamp_min(self.eps))
+        self.similarity_mean.copy_(torch.as_tensor(similarity_mean, device=device, dtype=self.similarity_mean.dtype))
+        self.similarity_std.copy_(torch.as_tensor(similarity_std, device=device, dtype=self.similarity_std.dtype).clamp_min(self.eps))
+        self.score_stats_count.copy_(torch.as_tensor(int(count), device=device, dtype=self.score_stats_count.dtype))
+
+    def get_score_stats(self) -> Dict[str, float]:
+        """Return train-set-level routing score normalization statistics."""
+        return {
+            "attribution_mean": float(self.attribution_mean.detach().cpu().item()),
+            "attribution_std": float(self.attribution_std.detach().cpu().item()),
+            "similarity_mean": float(self.similarity_mean.detach().cpu().item()),
+            "similarity_std": float(self.similarity_std.detach().cpu().item()),
+            "count": int(self.score_stats_count.detach().cpu().item()),
+        }
 
     @property
     def lambda_similarity(self) -> torch.Tensor:
@@ -188,6 +224,7 @@ class DualConsistencyRouter(nn.Module):
             "gamma_logit": float(gamma_logit.item()),
             "gamma": float(gamma.item()),
             "score_temperature": float(self.score_temperature),
+            **self.get_score_stats(),
         }
 
     def compute_weights(
@@ -202,10 +239,21 @@ class DualConsistencyRouter(nn.Module):
                 f"Got {tuple(attribution_scores.shape)} and {tuple(similarity_scores.shape)}."
             )
 
-        norm_attr = zscore_over_encoders(attribution_scores, eps=self.eps)
-        norm_sim = zscore_over_encoders(similarity_scores, eps=self.eps)
+        norm_attr = zscore_with_global_stats(
+            attribution_scores,
+            mean=self.attribution_mean,
+            std=self.attribution_std,
+            eps=self.eps,
+        )
+        norm_sim = zscore_with_global_stats(
+            similarity_scores,
+            mean=self.similarity_mean,
+            std=self.similarity_std,
+            eps=self.eps,
+        )
         combined = self.lambda_attribution * norm_attr + self.lambda_similarity * norm_sim
-        weights = torch.softmax(combined / self.score_temperature, dim=-1)
+        gates = torch.sigmoid(combined)
+        weights = gates / gates.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         return weights, combined, norm_attr, norm_sim
 
     def forward(

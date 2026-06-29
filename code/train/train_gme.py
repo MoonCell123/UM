@@ -574,6 +574,75 @@ def build_beacon_and_baselines(
     return beacon, baselines, beacon_acc.summary()
 
 
+def _mean_std_from_score_list(scores: Sequence[torch.Tensor], eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    if not scores:
+        raise RuntimeError("Cannot compute routing score stats from an empty score list.")
+    values = torch.cat([score.detach().reshape(-1).float().cpu() for score in scores], dim=0)
+    mean = values.mean()
+    std = values.std(unbiased=False).clamp_min(eps)
+    return mean, std, int(values.numel())
+
+
+@torch.no_grad()
+def update_train_routing_score_stats(
+    model: GMEModel,
+    dataset: MultiEncoderSlideDataset,
+    device: torch.device,
+    beacon: torch.Tensor,
+    baselines: Mapping[str, Mapping[str, torch.Tensor]],
+    replacement_strategy: str,
+    gaussian_std_scale: float,
+) -> Dict[str, float]:
+    """Estimate scalar I/s normalization stats from the whole train split."""
+    was_training = model.training
+    model.eval()
+
+    sim_scores = []
+    for idx in range(len(dataset)):
+        raw_features, _, _ = dataset[idx]
+        raw_features = move_features(raw_features, device)
+        projected = model.project(raw_features)
+        sim_scores.append(model.similarity_scores(projected, beacon))
+
+    sim_mean, sim_std, sim_count = _mean_std_from_score_list(sim_scores)
+
+    # Attribution needs similarity-only routing internally. Use train-set
+    # similarity stats first, then estimate train-set attribution stats.
+    model.router.set_score_stats(
+        attribution_mean=0.0,
+        attribution_std=1.0,
+        similarity_mean=sim_mean,
+        similarity_std=sim_std,
+        count=sim_count,
+    )
+
+    attr_scores = []
+    for idx in range(len(dataset)):
+        raw_features, _, _ = dataset[idx]
+        raw_features = move_features(raw_features, device)
+        projected = model.project(raw_features)
+        attr_scores.append(
+            model.intervention_attribution(
+                projected=projected,
+                beacon=beacon,
+                baselines=baselines,
+                replacement_strategy=replacement_strategy,
+                gaussian_std_scale=gaussian_std_scale,
+            )
+        )
+
+    attr_mean, attr_std, attr_count = _mean_std_from_score_list(attr_scores)
+    model.router.set_score_stats(
+        attribution_mean=attr_mean,
+        attribution_std=attr_std,
+        similarity_mean=sim_mean,
+        similarity_std=sim_std,
+        count=min(attr_count, sim_count),
+    )
+    model.train(was_training)
+    return model.router.get_score_stats()
+
+
 def train_stage1_epoch(model: GMEModel, dataset: MultiEncoderSlideDataset, optimizer, device: torch.device, grad_clip: float) -> float:
     model.train()
     criterion = nn.CrossEntropyLoss()
@@ -921,6 +990,15 @@ def run_fold(
         max_patches=args.beacon_max_patches,
         training=False,
     )
+    score_stats_ds = MultiEncoderSlideDataset(
+        manifest=manifest,
+        fold=fold,
+        split="train",
+        clinical_df=clinical_df,
+        label_col=args.label_col,
+        max_patches=args.max_patches,
+        training=False,
+    )
     beacon, baselines, beacon_summary = build_beacon_and_baselines(model, beacon_ds, device, args.target_dim)
     torch.save(
         {
@@ -951,6 +1029,15 @@ def run_fold(
     no_improve = 0
 
     for epoch in range(1, args.stage2_epochs + 1):
+        score_stats = update_train_routing_score_stats(
+            model=model,
+            dataset=score_stats_ds,
+            device=device,
+            beacon=beacon,
+            baselines=baselines,
+            replacement_strategy=args.replacement_strategy,
+            gaussian_std_scale=args.gaussian_std_scale,
+        )
         train_loss = train_stage2_epoch(
             model=model,
             dataset=train_ds,
@@ -961,6 +1048,15 @@ def run_fold(
             replacement_strategy=args.replacement_strategy,
             gaussian_std_scale=args.gaussian_std_scale,
             grad_clip=args.grad_clip,
+        )
+        score_stats = update_train_routing_score_stats(
+            model=model,
+            dataset=score_stats_ds,
+            device=device,
+            beacon=beacon,
+            baselines=baselines,
+            replacement_strategy=args.replacement_strategy,
+            gaussian_std_scale=args.gaussian_std_scale,
         )
         val_metrics, val_pred, val_weights = evaluate_stage2(
             model=model,
@@ -978,7 +1074,8 @@ def run_fold(
             f"Fold {fold} | Stage2 | Epoch {epoch:03d}/{args.stage2_epochs} | "
             f"loss={train_loss:.4f} | AUC={val_metrics.auc:.4f} | AUPRC={val_metrics.auprc:.4f} | "
             f"Sens={val_metrics.sensitivity:.4f} | Spec={val_metrics.specificity:.4f} | "
-            f"lambda_sim={stats['lambda_similarity']:.3f} | gamma={stats['gamma']:.3f}"
+            f"lambda_sim={stats['lambda_similarity']:.3f} | gamma={stats['gamma']:.3f} | "
+            f"I_mu={score_stats['attribution_mean']:.4f} | s_mu={score_stats['similarity_mean']:.4f}"
         )
 
         improved = not np.isnan(val_metrics.auc) and val_metrics.auc > best_stage2_auc
@@ -995,6 +1092,7 @@ def run_fold(
                     "input_dims": input_dims,
                     "stage": "stage2_gme",
                     "beacon_path": str(fold_dir / "static_beacon_and_baselines.pt"),
+                    "routing_score_stats": score_stats,
                 },
             )
             save_fold_outputs(fold_dir, "stage2", val_metrics, val_pred, val_weights)
