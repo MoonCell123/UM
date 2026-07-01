@@ -583,6 +583,13 @@ def _mean_std_from_score_list(scores: Sequence[torch.Tensor], eps: float = 1e-8)
     return mean, std, int(values.numel())
 
 
+def _min_max_from_score_list(scores: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    if not scores:
+        raise RuntimeError("Cannot compute routing score stats from an empty score list.")
+    values = torch.cat([score.detach().reshape(-1).float().cpu() for score in scores], dim=0)
+    return values.min(), values.max(), int(values.numel())
+
+
 @torch.no_grad()
 def update_train_routing_score_stats(
     model: GMEModel,
@@ -609,8 +616,8 @@ def update_train_routing_score_stats(
     # Attribution needs similarity-only routing internally. Use train-set
     # similarity stats first, then estimate train-set attribution stats.
     model.router.set_score_stats(
-        attribution_mean=0.0,
-        attribution_std=1.0,
+        attribution_min=0.0,
+        attribution_max=1.0,
         similarity_mean=sim_mean,
         similarity_std=sim_std,
         count=sim_count,
@@ -631,10 +638,10 @@ def update_train_routing_score_stats(
             )
         )
 
-    attr_mean, attr_std, attr_count = _mean_std_from_score_list(attr_scores)
+    attr_min, attr_max, attr_count = _min_max_from_score_list(attr_scores)
     model.router.set_score_stats(
-        attribution_mean=attr_mean,
-        attribution_std=attr_std,
+        attribution_min=attr_min,
+        attribution_max=attr_max,
         similarity_mean=sim_mean,
         similarity_std=sim_std,
         count=min(attr_count, sim_count),
@@ -1075,7 +1082,8 @@ def run_fold(
             f"loss={train_loss:.4f} | AUC={val_metrics.auc:.4f} | AUPRC={val_metrics.auprc:.4f} | "
             f"Sens={val_metrics.sensitivity:.4f} | Spec={val_metrics.specificity:.4f} | "
             f"lambda_sim={stats['lambda_similarity']:.3f} | gamma={stats['gamma']:.3f} | "
-            f"I_mu={score_stats['attribution_mean']:.4f} | s_mu={score_stats['similarity_mean']:.4f}"
+            f"I_min={score_stats['attribution_min']:.4f} | I_max={score_stats['attribution_max']:.4f} | "
+            f"s_mu={score_stats['similarity_mean']:.4f}"
         )
 
         improved = not np.isnan(val_metrics.auc) and val_metrics.auc > best_stage2_auc

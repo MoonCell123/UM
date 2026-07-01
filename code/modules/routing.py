@@ -47,6 +47,18 @@ def zscore_with_global_stats(
     return (scores - mean) / std.clamp_min(eps)
 
 
+def minmax_with_global_stats(
+    scores: torch.Tensor,
+    minimum: torch.Tensor,
+    maximum: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Min-max normalize scores with train-set-level scalar statistics."""
+    minimum = minimum.to(device=scores.device, dtype=scores.dtype)
+    maximum = maximum.to(device=scores.device, dtype=scores.dtype)
+    return (scores - minimum) / (maximum - minimum).clamp_min(eps)
+
+
 def stack_feature_dict(
     features_by_encoder: TensorDict,
     encoder_names: Iterable[str] | None = None,
@@ -145,7 +157,7 @@ def dual_consistency_fusion(
     adaptive_fused = torch.sum(expanded_weights * stacked_features, dim=-2)
     mean_fused = stacked_features.mean(dim=-2)
     gamma_tensor = torch.as_tensor(gamma, device=stacked_features.device, dtype=stacked_features.dtype)
-    fused = (1.0 - gamma_tensor) * adaptive_fused + gamma_tensor * mean_fused
+    fused = adaptive_fused
     return fused, adaptive_fused, mean_fused, names
 
 
@@ -166,24 +178,24 @@ class DualConsistencyRouter(nn.Module):
         self.eps = float(eps)
         self.theta = nn.Parameter(torch.tensor(float(theta_init)))
         self.gamma_logit = nn.Parameter(torch.tensor(_logit_from_probability(gamma_init)))
-        self.register_buffer("attribution_mean", torch.tensor(0.0))
-        self.register_buffer("attribution_std", torch.tensor(1.0))
+        self.register_buffer("attribution_min", torch.tensor(0.0))
+        self.register_buffer("attribution_max", torch.tensor(1.0))
         self.register_buffer("similarity_mean", torch.tensor(0.0))
         self.register_buffer("similarity_std", torch.tensor(1.0))
         self.register_buffer("score_stats_count", torch.tensor(0, dtype=torch.long))
 
     def set_score_stats(
         self,
-        attribution_mean: torch.Tensor | float,
-        attribution_std: torch.Tensor | float,
+        attribution_min: torch.Tensor | float,
+        attribution_max: torch.Tensor | float,
         similarity_mean: torch.Tensor | float,
         similarity_std: torch.Tensor | float,
         count: int,
     ) -> None:
-        """Store train-set-level statistics used to standardize routing scores."""
-        device = self.attribution_mean.device
-        self.attribution_mean.copy_(torch.as_tensor(attribution_mean, device=device, dtype=self.attribution_mean.dtype))
-        self.attribution_std.copy_(torch.as_tensor(attribution_std, device=device, dtype=self.attribution_std.dtype).clamp_min(self.eps))
+        """Store train-set-level statistics used to normalize routing scores."""
+        device = self.attribution_min.device
+        self.attribution_min.copy_(torch.as_tensor(attribution_min, device=device, dtype=self.attribution_min.dtype))
+        self.attribution_max.copy_(torch.as_tensor(attribution_max, device=device, dtype=self.attribution_max.dtype))
         self.similarity_mean.copy_(torch.as_tensor(similarity_mean, device=device, dtype=self.similarity_mean.dtype))
         self.similarity_std.copy_(torch.as_tensor(similarity_std, device=device, dtype=self.similarity_std.dtype).clamp_min(self.eps))
         self.score_stats_count.copy_(torch.as_tensor(int(count), device=device, dtype=self.score_stats_count.dtype))
@@ -191,8 +203,8 @@ class DualConsistencyRouter(nn.Module):
     def get_score_stats(self) -> Dict[str, float]:
         """Return train-set-level routing score normalization statistics."""
         return {
-            "attribution_mean": float(self.attribution_mean.detach().cpu().item()),
-            "attribution_std": float(self.attribution_std.detach().cpu().item()),
+            "attribution_min": float(self.attribution_min.detach().cpu().item()),
+            "attribution_max": float(self.attribution_max.detach().cpu().item()),
             "similarity_mean": float(self.similarity_mean.detach().cpu().item()),
             "similarity_std": float(self.similarity_std.detach().cpu().item()),
             "count": int(self.score_stats_count.detach().cpu().item()),
@@ -239,10 +251,10 @@ class DualConsistencyRouter(nn.Module):
                 f"Got {tuple(attribution_scores.shape)} and {tuple(similarity_scores.shape)}."
             )
 
-        norm_attr = zscore_with_global_stats(
+        norm_attr = minmax_with_global_stats(
             attribution_scores,
-            mean=self.attribution_mean,
-            std=self.attribution_std,
+            minimum=self.attribution_min,
+            maximum=self.attribution_max,
             eps=self.eps,
         )
         norm_sim = zscore_with_global_stats(
@@ -251,7 +263,7 @@ class DualConsistencyRouter(nn.Module):
             std=self.similarity_std,
             eps=self.eps,
         )
-        combined = self.lambda_attribution * norm_attr + self.lambda_similarity * norm_sim
+        combined = norm_attr
         gates = torch.sigmoid(combined)
         weights = gates / gates.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         return weights, combined, norm_attr, norm_sim
