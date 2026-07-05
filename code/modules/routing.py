@@ -140,9 +140,15 @@ class DualConsistencyRouter(nn.Module):
 
     def __init__(
         self,
+        routing_temperature: float = 0.5,
+        routing_logit_scale: float = 1.0,
         eps: float = 1e-8,
     ):
         super().__init__()
+        if routing_temperature <= 0:
+            raise ValueError("routing_temperature must be positive.")
+        self.routing_temperature = float(routing_temperature)
+        self.routing_logit_scale = float(routing_logit_scale)
         self.eps = float(eps)
         self.register_buffer("attribution_min", torch.tensor(0.0))
         self.register_buffer("attribution_max", torch.tensor(1.0))
@@ -170,22 +176,29 @@ class DualConsistencyRouter(nn.Module):
 
     def get_routing_stats(self) -> Dict[str, float]:
         """Return scalar routing parameters for logging/visualization."""
-        return self.get_score_stats()
+        stats = self.get_score_stats()
+        stats["routing_temperature"] = float(self.routing_temperature)
+        stats["routing_logit_scale"] = float(self.routing_logit_scale)
+        return stats
 
     def compute_weights(
         self,
         attribution_scores: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute alpha from attribution scores."""
+        """Compute routing weights from attribution logits.
+
+        The old sigmoid gate compressed min-max attribution into a very narrow
+        range. Here attribution directly forms the gate logits; temperature and
+        scale control how selective the router is.
+        """
         norm_attr = minmax_with_global_stats(
             attribution_scores,
             minimum=self.attribution_min,
             maximum=self.attribution_max,
             eps=self.eps,
         )
-        combined = norm_attr
-        gates = torch.sigmoid(combined)
-        weights = gates / gates.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        combined = norm_attr * self.routing_logit_scale / self.routing_temperature
+        weights = torch.softmax(combined, dim=-1)
         return weights, combined, norm_attr
 
     def forward(

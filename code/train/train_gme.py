@@ -63,7 +63,7 @@ DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests" / "middle
 DEFAULT_MANIFEST_DIR = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "GME"
 FEATURE_KEYS = ("feats", "features")
-PATH_ARGS = ("manifest", "manifest_dir", "output_dir")
+PATH_ARGS = ("manifest", "manifest_dir", "output_dir", "run_dir")
 
 
 @dataclass
@@ -112,6 +112,10 @@ def add_config_argument(parser: argparse.ArgumentParser) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    add_config_argument(config_parser)
+    config_args, _ = config_parser.parse_known_args()
+
     parser = argparse.ArgumentParser(
         description="One-command end-to-end GME middle-fusion training on multi-encoder h5 embeddings."
     )
@@ -125,6 +129,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clinical-path", default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--experiment-name", default="gme")
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Exact output directory for this run. Overrides --output-dir/--experiment-name timestamp layout.",
+    )
     parser.add_argument("--label-col", default="d3m3")
     parser.add_argument("--folds", type=int, nargs="*", default=None, help="Fold ids to run. Default: all folds.")
     parser.add_argument("--seed", type=int, default=42)
@@ -192,6 +202,18 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Weight for the static Beacon global semantic prior constraint. 0 disables it.",
     )
+    parser.add_argument(
+        "--routing-temperature",
+        type=float,
+        default=0.5,
+        help="Temperature for attribution gate logits. Smaller values make routing more selective.",
+    )
+    parser.add_argument(
+        "--routing-logit-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to normalized attribution before softmax routing.",
+    )
 
     parser.add_argument(
         "--max-patches",
@@ -215,7 +237,6 @@ def parse_args() -> argparse.Namespace:
     # Backward-compatible no-op arguments for older config files.
     parser.add_argument("--skip-routing-lambda-analysis", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--strict-routing-lambda-analysis", action="store_true", help=argparse.SUPPRESS)
-    config_args, remaining = parser.parse_known_args()
     config = load_config_file(config_args.config)
     if config:
         valid_dests = {action.dest for action in parser._actions}
@@ -223,7 +244,7 @@ def parse_args() -> argparse.Namespace:
         if unknown:
             raise ValueError(f"Unknown config keys in {config_args.config}: {unknown}")
         parser.set_defaults(**config)
-    args = parser.parse_args(remaining)
+    args = parser.parse_args()
     args.config = config_args.config
     for name in PATH_ARGS:
         value = getattr(args, name, None)
@@ -395,6 +416,8 @@ class GMEModel(nn.Module):
         d_attn: int = 128,
         n_classes: int = 2,
         droprate: float = 0.25,
+        routing_temperature: float = 0.5,
+        routing_logit_scale: float = 1.0,
     ):
         super().__init__()
         self.encoder_names = sorted(input_dims.keys())
@@ -404,7 +427,10 @@ class GMEModel(nn.Module):
             target_dim=target_dim,
             dropout=projection_dropout,
         )
-        self.router = DualConsistencyRouter()
+        self.router = DualConsistencyRouter(
+            routing_temperature=routing_temperature,
+            routing_logit_scale=routing_logit_scale,
+        )
         self.classifier = ABMIL_Cls(
             D_feat=target_dim,
             D_inner=d_inner,
@@ -1027,6 +1053,8 @@ def run_fold(
         d_attn=args.d_attn,
         n_classes=args.n_classes,
         droprate=args.droprate,
+        routing_temperature=args.routing_temperature,
+        routing_logit_scale=args.routing_logit_scale,
     ).to(device)
 
     print(f"\nFold {fold}: train={len(train_ds)}, val={len(val_ds)}, encoders={train_ds.encoder_names}")
@@ -1425,8 +1453,11 @@ def main() -> None:
     if missing_folds:
         raise ValueError(f"Requested folds not found in manifest: {missing_folds}. Available: {all_folds}")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = args.output_dir / args.experiment_name / timestamp
+    if args.run_dir is not None:
+        output_dir = args.run_dir
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = args.output_dir / args.experiment_name / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(output_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, f, indent=2)
