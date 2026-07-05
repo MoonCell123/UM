@@ -6,6 +6,7 @@ Baselines implemented here:
 2. mean            : per-encoder ProjectionHead -> mean over encoders -> ABMIL.
 3. concat          : per-encoder ProjectionHead -> concat -> linear reduction -> ABMIL.
 4. cross_attention : per-encoder ProjectionHead -> encoder-token cross attention -> ABMIL.
+5. self_attention  : per-encoder ProjectionHead -> encoder-token self attention -> ABMIL.
 
 These are conventional baselines for comparing against train_gme.py. They do
 not use Beacon, intervention attribution, or GME routing.
@@ -36,6 +37,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
 
 
@@ -55,7 +57,7 @@ DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests" / "middle
 DEFAULT_MANIFEST_DIR = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "Offline_Fusion_Baselines"
 FEATURE_KEYS = ("feats", "features")
-METHODS = ("no_fusion", "mean", "concat", "cross_attention")
+METHODS = ("mean", "concat", "cross_attention", "self_attention")
 PATH_ARGS = ("manifest", "manifest_dir", "output_dir")
 
 
@@ -63,6 +65,7 @@ PATH_ARGS = ("manifest", "manifest_dir", "output_dir")
 class EvalResult:
     auc: float
     auprc: float
+    threshold: float
     sensitivity: float
     specificity: float
     accuracy: float
@@ -371,12 +374,44 @@ class CrossAttentionFusion(nn.Module):
         return x.mean(dim=1)
 
 
+class SelfAttentionFusion(nn.Module):
+    """Per-patch self-attention over encoder tokens followed by learned reduction."""
+
+    def __init__(self, dim: int, num_encoders: int, heads: int = 4, layers: int = 1, dropout: float = 0.0):
+        super().__init__()
+        if dim % heads != 0:
+            raise ValueError(f"target_dim={dim} must be divisible by cross_attn_heads={heads}.")
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=dim,
+                nhead=heads,
+                dim_feedforward=dim * 2,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(layers)
+        ])
+        self.reduce = nn.Sequential(
+            nn.Linear(dim * num_encoders, dim),
+            nn.LayerNorm(dim),
+        )
+        self.apply(initialize_projection_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [N_patches, M_encoders, D]
+        for layer in self.layers:
+            x = layer(x)
+        return self.reduce(x.flatten(start_dim=1))
+
+
 class ProjectedFusionABMIL(nn.Module):
     """Projected multi-encoder fusion baseline followed by ABMIL."""
 
     def __init__(self, method: str, input_dims: Mapping[str, int], args: argparse.Namespace):
         super().__init__()
-        if method not in {"mean", "concat", "cross_attention"}:
+        if method not in {"mean", "concat", "cross_attention", "self_attention"}:
             raise ValueError(f"Unsupported projected fusion method: {method}")
         self.method = method
         self.encoder_names = sorted(input_dims.keys())
@@ -404,6 +439,17 @@ class ProjectedFusionABMIL(nn.Module):
         else:
             self.cross_attention = None
 
+        if method == "self_attention":
+            self.self_attention = SelfAttentionFusion(
+                dim=args.target_dim,
+                num_encoders=len(self.encoder_names),
+                heads=args.cross_attn_heads,
+                layers=args.cross_attn_layers,
+                dropout=args.projection_dropout,
+            )
+        else:
+            self.self_attention = None
+
         self.classifier = ABMIL_Cls(
             D_feat=args.target_dim,
             D_inner=args.d_inner,
@@ -421,6 +467,8 @@ class ProjectedFusionABMIL(nn.Module):
             return self.concat_reduce(torch.cat(tensors, dim=-1))
         if self.method == "cross_attention":
             return self.cross_attention(torch.stack(tensors, dim=1))
+        if self.method == "self_attention":
+            return self.self_attention(torch.stack(tensors, dim=1))
         raise RuntimeError(f"Unknown method: {self.method}")
 
     def forward(self, raw_features: Mapping[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -431,9 +479,22 @@ def move_features(features: Mapping[str, torch.Tensor], device: torch.device) ->
     return {name: value.float().to(device) for name, value in features.items()}
 
 
-def compute_metrics(labels: Sequence[int], probs: Sequence[float], threshold: float) -> EvalResult:
+def youden_threshold(labels: np.ndarray, probs: np.ndarray, fallback: float = 0.5) -> float:
+    if np.unique(labels).size < 2:
+        return float(fallback)
+    fpr, tpr, thresholds = roc_curve(labels, probs)
+    finite = np.isfinite(thresholds)
+    if not finite.any():
+        return float(fallback)
+    fpr, tpr, thresholds = fpr[finite], tpr[finite], thresholds[finite]
+    youden = tpr - fpr
+    return float(thresholds[int(np.argmax(youden))])
+
+
+def compute_metrics(labels: Sequence[int], probs: Sequence[float], fallback_threshold: float = 0.5) -> EvalResult:
     labels_np = np.asarray(labels, dtype=int)
     probs_np = np.asarray(probs, dtype=float)
+    threshold = youden_threshold(labels_np, probs_np, fallback=fallback_threshold)
     preds_np = (probs_np >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(labels_np, preds_np, labels=[0, 1]).ravel()
     sensitivity = tp / (tp + fn) if (tp + fn) else np.nan
@@ -449,6 +510,7 @@ def compute_metrics(labels: Sequence[int], probs: Sequence[float], threshold: fl
     return EvalResult(
         auc=float(auc),
         auprc=float(auprc),
+        threshold=float(threshold),
         sensitivity=float(sensitivity),
         specificity=float(specificity),
         accuracy=float(accuracy_score(labels_np, preds_np)),
@@ -484,7 +546,7 @@ def train_one_epoch(model: nn.Module, dataset: MultiEncoderSlideDataset, optimiz
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, dataset: MultiEncoderSlideDataset, device: torch.device, threshold: float) -> Tuple[EvalResult, pd.DataFrame]:
+def evaluate(model: nn.Module, dataset: MultiEncoderSlideDataset, device: torch.device, fallback_threshold: float) -> Tuple[EvalResult, pd.DataFrame]:
     model.eval()
     labels, probs, rows = [], [], []
     for idx in range(len(dataset)):
@@ -495,9 +557,10 @@ def evaluate(model: nn.Module, dataset: MultiEncoderSlideDataset, device: torch.
         labels.append(int(label))
         probs.append(prob)
         rows.append({"slide_id": slide_id, "label": int(label), "prob_class1": prob})
-    metrics = compute_metrics(labels, probs, threshold)
+    metrics = compute_metrics(labels, probs, fallback_threshold=fallback_threshold)
     pred_df = pd.DataFrame(rows)
-    pred_df["pred"] = (pred_df["prob_class1"] >= threshold).astype(int)
+    pred_df["threshold"] = metrics.threshold
+    pred_df["pred"] = (pred_df["prob_class1"] >= metrics.threshold).astype(int)
     return metrics, pred_df
 
 
@@ -641,11 +704,21 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
     fold_df = pd.DataFrame(fold_rows)
     fold_df.to_csv(output_dir / "fold_metrics.csv", index=False, encoding="utf-8-sig", float_format="%.6f")
 
-    rows = []
+    if fold_df.empty:
+        return
+
     group_cols = ["method", "model_name", "encoders"]
+    metric_cols = ["auc", "auprc", "sensitivity", "specificity", "accuracy", "f1", "precision", "recall"]
     for keys, group in fold_df.groupby(group_cols, dropna=False):
-        key_dict = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
-        for metric in ["auc", "auprc", "sensitivity", "specificity", "accuracy", "f1", "precision", "recall"]:
+        key_values = keys if isinstance(keys, tuple) else (keys,)
+        key_dict = dict(zip(group_cols, key_values))
+        model_dir = output_dir / str(key_dict["model_name"])
+        model_dir.mkdir(parents=True, exist_ok=True)
+        group = group.sort_values("fold")
+        group.to_csv(model_dir / "fold_metrics.csv", index=False, encoding="utf-8-sig", float_format="%.6f")
+
+        rows = []
+        for metric in metric_cols:
             values = pd.to_numeric(group[metric], errors="coerce")
             rows.append({
                 **key_dict,
@@ -656,7 +729,12 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
                 "median": float(values.median(skipna=True)),
                 "max": float(values.max(skipna=True)),
             })
-    pd.DataFrame(rows).to_csv(output_dir / "summary_metrics.csv", index=False, encoding="utf-8-sig", float_format="%.6f")
+        pd.DataFrame(rows).to_csv(
+            model_dir / "summary_metrics.csv",
+            index=False,
+            encoding="utf-8-sig",
+            float_format="%.6f",
+        )
 
 
 def main() -> None:
@@ -716,8 +794,13 @@ def main() -> None:
                 summarize(fold_rows, output_dir)
 
     summarize(fold_rows, output_dir)
-    print("\nSummary:")
-    print(pd.read_csv(output_dir / "summary_metrics.csv").to_string(index=False))
+    print("\nSummary files:")
+    if fold_rows:
+        summary_dirs = sorted({str(row["model_name"]) for row in fold_rows})
+        for model_name in summary_dirs:
+            summary_path = output_dir / model_name / "summary_metrics.csv"
+            if summary_path.exists():
+                print(f"  {summary_path}")
     print(f"\nSaved output: {output_dir}")
 
 

@@ -1,4 +1,4 @@
-"""Routing weights and dual-consistency fusion for CGME/GME middle fusion.
+"""Attribution-only routing weights and fusion for GME middle fusion.
 """
 
 from __future__ import annotations
@@ -20,26 +20,21 @@ class RoutingOutput:
     fused: torch.Tensor
     weights: torch.Tensor
     adaptive_fused: torch.Tensor
-    mean_fused: torch.Tensor
     combined_scores: torch.Tensor
     normalized_attribution: torch.Tensor
-    normalized_similarity: torch.Tensor
-    lambda_similarity: torch.Tensor
-    lambda_attribution: torch.Tensor
-    gamma: torch.Tensor
     encoder_names: Sequence[str]
 
 
-def _logit_from_probability(value: float, eps: float = 1e-6) -> float:
-    value = min(max(float(value), eps), 1.0 - eps)
-    return float(torch.logit(torch.tensor(value)).item())
-
-
-def zscore_over_encoders(scores: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Normalize scores over the encoder dimension, i.e. the last dimension."""
-    mean = scores.mean(dim=-1, keepdim=True)
-    std = scores.std(dim=-1, keepdim=True, unbiased=False)
-    return (scores - mean) / std.clamp_min(eps)
+def minmax_with_global_stats(
+    scores: torch.Tensor,
+    minimum: torch.Tensor,
+    maximum: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Min-max normalize scores with train-set-level scalar statistics."""
+    minimum = minimum.to(device=scores.device, dtype=scores.dtype)
+    maximum = maximum.to(device=scores.device, dtype=scores.dtype)
+    return (scores - minimum) / (maximum - minimum).clamp_min(eps)
 
 
 def stack_feature_dict(
@@ -130,104 +125,86 @@ def _expand_weights_for_stacked_features(weights: torch.Tensor, stacked_features
 def dual_consistency_fusion(
     features_by_encoder: TensorDict,
     weights: torch.Tensor,
-    gamma: torch.Tensor | float,
     encoder_names: Iterable[str] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
-    """Fuse projected encoder embeddings with adaptive and mean branches."""
+) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    """Fuse projected encoder embeddings with attribution-derived weights."""
     stacked_features, names = stack_feature_dict(features_by_encoder, encoder_names)
     expanded_weights = _expand_weights_for_stacked_features(weights, stacked_features)
 
     adaptive_fused = torch.sum(expanded_weights * stacked_features, dim=-2)
-    mean_fused = stacked_features.mean(dim=-2)
-    gamma_tensor = torch.as_tensor(gamma, device=stacked_features.device, dtype=stacked_features.dtype)
-    fused = (1.0 - gamma_tensor) * adaptive_fused + gamma_tensor * mean_fused
-    return fused, adaptive_fused, mean_fused, names
+    return adaptive_fused, adaptive_fused, names
 
 
 class DualConsistencyRouter(nn.Module):
-    """Combine attribution/similarity scores and fuse multi-encoder embeddings."""
+    """Fuse multi-encoder embeddings using attribution-only routing scores."""
 
     def __init__(
         self,
-        score_temperature: float = 1.0,
-        theta_init: float = 0.0,
-        gamma_init: float = 0.0,
         eps: float = 1e-8,
     ):
         super().__init__()
-        if score_temperature <= 0:
-            raise ValueError("score_temperature must be positive.")
-        self.score_temperature = float(score_temperature)
         self.eps = float(eps)
-        self.theta = nn.Parameter(torch.tensor(float(theta_init)))
-        self.gamma_logit = nn.Parameter(torch.tensor(_logit_from_probability(gamma_init)))
+        self.register_buffer("attribution_min", torch.tensor(0.0))
+        self.register_buffer("attribution_max", torch.tensor(1.0))
+        self.register_buffer("score_stats_count", torch.tensor(0, dtype=torch.long))
 
-    @property
-    def lambda_similarity(self) -> torch.Tensor:
-        return torch.sigmoid(self.theta)
+    def set_score_stats(
+        self,
+        attribution_min: torch.Tensor | float,
+        attribution_max: torch.Tensor | float,
+        count: int,
+    ) -> None:
+        """Store train-set-level statistics used to normalize routing scores."""
+        device = self.attribution_min.device
+        self.attribution_min.copy_(torch.as_tensor(attribution_min, device=device, dtype=self.attribution_min.dtype))
+        self.attribution_max.copy_(torch.as_tensor(attribution_max, device=device, dtype=self.attribution_max.dtype))
+        self.score_stats_count.copy_(torch.as_tensor(int(count), device=device, dtype=self.score_stats_count.dtype))
 
-    @property
-    def lambda_attribution(self) -> torch.Tensor:
-        return 1.0 - self.lambda_similarity
-
-    @property
-    def gamma(self) -> torch.Tensor:
-        return torch.sigmoid(self.gamma_logit)
+    def get_score_stats(self) -> Dict[str, float]:
+        """Return train-set-level routing score normalization statistics."""
+        return {
+            "attribution_min": float(self.attribution_min.detach().cpu().item()),
+            "attribution_max": float(self.attribution_max.detach().cpu().item()),
+            "count": int(self.score_stats_count.detach().cpu().item()),
+        }
 
     def get_routing_stats(self) -> Dict[str, float]:
         """Return scalar routing parameters for logging/visualization."""
-        lambda_similarity = self.lambda_similarity.detach().cpu()
-        lambda_attribution = self.lambda_attribution.detach().cpu()
-        gamma = self.gamma.detach().cpu()
-        theta = self.theta.detach().cpu()
-        gamma_logit = self.gamma_logit.detach().cpu()
-        return {
-            "theta": float(theta.item()),
-            "lambda_similarity": float(lambda_similarity.item()),
-            "lambda_attribution": float(lambda_attribution.item()),
-            "gamma_logit": float(gamma_logit.item()),
-            "gamma": float(gamma.item()),
-            "score_temperature": float(self.score_temperature),
-        }
+        return self.get_score_stats()
 
     def compute_weights(
         self,
         attribution_scores: torch.Tensor,
-        similarity_scores: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute alpha from attribution and Beacon-similarity scores."""
-        if attribution_scores.shape != similarity_scores.shape:
-            raise ValueError(
-                "Attribution and similarity scores must have identical shapes. "
-                f"Got {tuple(attribution_scores.shape)} and {tuple(similarity_scores.shape)}."
-            )
-
-        norm_attr = zscore_over_encoders(attribution_scores, eps=self.eps)
-        norm_sim = zscore_over_encoders(similarity_scores, eps=self.eps)
-        combined = self.lambda_attribution * norm_attr + self.lambda_similarity * norm_sim
-        weights = torch.softmax(combined / self.score_temperature, dim=-1)
-        return weights, combined, norm_attr, norm_sim
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute alpha from attribution scores."""
+        norm_attr = minmax_with_global_stats(
+            attribution_scores,
+            minimum=self.attribution_min,
+            maximum=self.attribution_max,
+            eps=self.eps,
+        )
+        combined = norm_attr
+        gates = torch.sigmoid(combined)
+        weights = gates / gates.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        return weights, combined, norm_attr
 
     def forward(
         self,
         features_by_encoder: TensorDict,
         attribution_scores: torch.Tensor | Mapping[str, torch.Tensor],
-        similarity_scores: torch.Tensor | Mapping[str, torch.Tensor],
         encoder_names: Iterable[str] | None = None,
     ) -> RoutingOutput:
-        """Compute routing weights and dual-consistency fused representation."""
+        """Compute routing weights and fused representation."""
         stacked_features, names = stack_feature_dict(features_by_encoder, encoder_names)
         del stacked_features
 
         attr = ensure_score_tensor(attribution_scores, names).to(
             device=next(iter(features_by_encoder.values())).device
         )
-        sim = ensure_score_tensor(similarity_scores, names).to(attr.device)
-        weights, combined, norm_attr, norm_sim = self.compute_weights(attr, sim)
-        fused, adaptive_fused, mean_fused, names = dual_consistency_fusion(
+        weights, combined, norm_attr = self.compute_weights(attr)
+        fused, adaptive_fused, names = dual_consistency_fusion(
             features_by_encoder=features_by_encoder,
             weights=weights,
-            gamma=self.gamma,
             encoder_names=names,
         )
 
@@ -235,12 +212,7 @@ class DualConsistencyRouter(nn.Module):
             fused=fused,
             weights=weights,
             adaptive_fused=adaptive_fused,
-            mean_fused=mean_fused,
             combined_scores=combined,
             normalized_attribution=norm_attr,
-            normalized_similarity=norm_sim,
-            lambda_similarity=self.lambda_similarity,
-            lambda_attribution=self.lambda_attribution,
-            gamma=self.gamma,
             encoder_names=names,
         )
