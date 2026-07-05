@@ -57,7 +57,7 @@ DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests" / "middle
 DEFAULT_MANIFEST_DIR = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "Offline_Fusion_Baselines"
 FEATURE_KEYS = ("feats", "features")
-METHODS = ("no_fusion", "mean", "concat", "cross_attention", "self_attention")
+METHODS = ("mean", "concat", "cross_attention", "self_attention")
 PATH_ARGS = ("manifest", "manifest_dir", "output_dir")
 
 
