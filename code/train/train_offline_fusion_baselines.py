@@ -58,7 +58,7 @@ DEFAULT_MANIFEST_DIR = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "Offline_Fusion_Baselines"
 FEATURE_KEYS = ("feats", "features")
 METHODS = ("mean", "concat", "cross_attention", "self_attention")
-PATH_ARGS = ("manifest", "manifest_dir", "output_dir")
+PATH_ARGS = ("manifest", "manifest_dir", "output_dir", "run_dir")
 
 
 @dataclass
@@ -107,6 +107,10 @@ def add_config_argument(parser: argparse.ArgumentParser) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    add_config_argument(config_parser)
+    config_args, _ = config_parser.parse_known_args()
+
     parser = argparse.ArgumentParser(description="Train offline fusion baselines on multi-encoder h5 embeddings.")
     add_config_argument(parser)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -119,6 +123,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clinical-path", default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--experiment-name", default="offline_fusion_baselines")
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Exact output directory for this run. Overrides --output-dir/--experiment-name timestamp layout.",
+    )
     parser.add_argument("--label-col", default="d3m3")
     parser.add_argument("--methods", nargs="+", default=["all"], choices=["all", *METHODS])
     parser.add_argument(
@@ -149,7 +159,6 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--max-patches", type=int, default=0, help="Random train patch cap per WSI. 0 = all patches.")
     parser.add_argument("--eval-max-patches", type=int, default=0, help="Deterministic val patch cap per WSI. 0 = all patches.")
-    config_args, remaining = parser.parse_known_args()
     config = load_config_file(config_args.config)
     if config:
         valid_dests = {action.dest for action in parser._actions}
@@ -157,7 +166,7 @@ def parse_args() -> argparse.Namespace:
         if unknown:
             raise ValueError(f"Unknown config keys in {config_args.config}: {unknown}")
         parser.set_defaults(**config)
-    args = parser.parse_args(remaining)
+    args = parser.parse_args()
     args.config = config_args.config
     for name in PATH_ARGS:
         value = getattr(args, name, None)
@@ -758,8 +767,11 @@ def main() -> None:
     if missing_folds:
         raise ValueError(f"Requested folds not found in manifest: {missing_folds}. Available: {all_folds}")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = args.output_dir / args.experiment_name / timestamp
+    if args.run_dir is not None:
+        output_dir = args.run_dir
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = args.output_dir / args.experiment_name / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(output_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, f, indent=2)

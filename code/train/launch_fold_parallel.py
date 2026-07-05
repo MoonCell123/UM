@@ -131,15 +131,6 @@ def normalize_extra_args(extra_args: Sequence[str]) -> List[str]:
     return args
 
 
-def latest_subdir(parent: Path) -> Path | None:
-    if not parent.exists():
-        return None
-    dirs = [path for path in parent.iterdir() if path.is_dir()]
-    if not dirs:
-        return None
-    return max(dirs, key=lambda path: path.stat().st_mtime)
-
-
 def summarize_metrics(fold_df: pd.DataFrame) -> pd.DataFrame:
     group_cols = [col for col in ("method", "model_name", "encoders") if col in fold_df.columns]
     rows = []
@@ -202,13 +193,16 @@ def main() -> None:
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     launch_dir = args.launch_output_dir / args.target / f"{base_experiment}_{timestamp}"
+    train_run_dir = output_dir / base_experiment / timestamp
     launch_dir.mkdir(parents=True, exist_ok=True)
+    train_run_dir.mkdir(parents=True, exist_ok=True)
 
     processes = []
-    expected_subrun_parents = []
+    expected_subrun_dirs = []
     script = TARGET_SCRIPTS[args.target]
     for idx, (gpu_id, folds) in enumerate(zip(args.gpus, fold_groups)):
         exp_name = f"{base_experiment}_gpu{gpu_id}_folds{fold_label(folds)}"
+        subrun_dir = train_run_dir / exp_name
         command = [
             python_executable,
             str(script),
@@ -220,15 +214,19 @@ def main() -> None:
             exp_name,
             "--output-dir",
             str(output_dir),
+            "--run-dir",
+            str(subrun_dir),
             *extra_args,
         ]
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        env["PYTHONUNBUFFERED"] = "1"
         log_path = launch_dir / f"gpu{gpu_id}_folds{fold_label(folds)}.log"
-        expected_subrun_parents.append(output_dir / exp_name)
+        expected_subrun_dirs.append(subrun_dir)
 
         print(f"\nGPU {gpu_id} folds {folds}")
         print("$ " + " ".join(command))
+        print(f"output: {subrun_dir}")
         print(f"log: {log_path}")
         if args.dry_run:
             continue
@@ -253,6 +251,7 @@ def main() -> None:
                 "folds": args.folds,
                 "split_mode": args.split_mode,
                 "output_dir": str(output_dir),
+                "train_run_dir": str(train_run_dir),
                 "base_experiment": base_experiment,
                 "extra_args": extra_args,
             },
@@ -274,18 +273,14 @@ def main() -> None:
         else:
             print(f"[Done] GPU {gpu_id}, folds {folds}")
 
-    subrun_dirs = []
-    for parent in expected_subrun_parents:
-        run_dir = latest_subdir(parent)
-        if run_dir is not None:
-            subrun_dirs.append(run_dir)
-    aggregate_subruns(subrun_dirs, launch_dir)
+    aggregate_subruns(expected_subrun_dirs, launch_dir)
 
     if failures:
         raise RuntimeError(f"Some fold-parallel jobs failed: {failures}. Logs are in {launch_dir}")
 
     print(f"\nFold-parallel run finished.")
     print(f"Launch output: {launch_dir}")
+    print(f"Training output: {train_run_dir}")
     print(f"Aggregated metrics: {launch_dir / 'parallel_summary_metrics.csv'}")
 
 
