@@ -56,6 +56,11 @@ from modules.beacon import infer_input_dims
 DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests" / "middle_fusion_manifest.csv"
 DEFAULT_MANIFEST_DIR = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "Offline_Fusion_Baselines"
+DEFAULT_FEATURE_DIRS = [
+    "features_hoptimus1",
+    "features_virchow",
+    "features_hoptimus0",
+]
 FEATURE_KEYS = ("feats", "features")
 METHODS = ("mean", "concat", "cross_attention", "self_attention")
 PATH_ARGS = ("manifest", "manifest_dir", "output_dir", "run_dir")
@@ -116,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--build-manifest", action="store_true")
     parser.add_argument("--feat-base", default=r"L:\20x_256px_0px_overlap")
-    parser.add_argument("--feature-dirs", nargs="+", default=["features_hoptimus1", "features_virchow", "features_hoptimus0"])
+    parser.add_argument("--feature-dirs", nargs="+", default=DEFAULT_FEATURE_DIRS)
     parser.add_argument("--manifest-dir", type=Path, default=DEFAULT_MANIFEST_DIR)
     parser.add_argument("--cv-folds", type=int, default=5)
 
@@ -204,7 +209,15 @@ def stable_name_offset(name: str) -> int:
 def ensure_manifest(args: argparse.Namespace) -> Path:
     manifest_path = Path(args.manifest)
     if manifest_path.exists() and not args.build_manifest:
-        return manifest_path
+        requested = {str(item) for item in args.feature_dirs}
+        existing = set(pd.read_csv(manifest_path, usecols=["feature_dir"])["feature_dir"].astype(str).unique())
+        if existing == requested:
+            return manifest_path
+        print(
+            "\nExisting manifest feature_dirs do not match config; rebuilding manifest.\n"
+            f"Existing: {sorted(existing)}\n"
+            f"Requested: {sorted(requested)}"
+        )
 
     output_dir = Path(args.manifest_dir)
     command = [
