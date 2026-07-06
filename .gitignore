@@ -1,14 +1,5 @@
 __pycache__/
 *.png
-*.aux
-*.log
-*.output
-*.bbl
-*.blg
-*.synctex.gz
-*.toc
-*.lof
-*.lot
 .*/
 idea.md
 output/

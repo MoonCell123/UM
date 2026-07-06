@@ -21,7 +21,11 @@ from sklearn.model_selection import KFold
 
 DEFAULT_FEAT_BASE = Path(r"L:\20x_256px_0px_overlap")
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "output" / "Middle_Fusion_Manifests"
-DEFAULT_FEATURE_DIRS = ["features_hoptimus1", "features_virchow", "features_hoptimus0"]
+DEFAULT_FEATURE_DIRS = [
+    "features_hoptimus1",
+    "features_virchow",
+    "features_hoptimus0",
+]
 FEATURE_KEYS = ("feats", "features")
 
 
