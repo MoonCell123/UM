@@ -1,0 +1,42 @@
+%========================================%
+%              Packages                     %
+%========================================%
+
+% --- Page geometry ---
+\usepackage[top=1in, bottom=1in, left=1in, right=1in]{geometry}
+
+% --- Math ---
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsfonts}
+\usepackage{bm}                % bold math symbols
+\usepackage{mathtools}         % enhancements to amsmath
+
+% --- Figures & graphics ---
+\usepackage{graphicx}
+\usepackage{subcaption}        % subfigures
+\usepackage{xcolor}            % custom colors
+
+% --- Tables ---
+\usepackage{booktabs}          % \toprule, \midrule, \bottomrule
+\usepackage{multirow}          % multi-row cells
+\usepackage{makecell}          % line breaks inside cells
+
+% --- Algorithms ---
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+% --- Bibliography ---
+\usepackage[authoryear,round,sort&compress]{natbib}
+
+% --- Hyperlinks (load last, with exceptions) ---
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue,
+}
+
+% --- Cross-references ---
+\usepackage[nameinlink,noabbrev]{cleveref}  % must be loaded after hyperref

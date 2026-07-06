@@ -1,0 +1,33 @@
+%========================================%
+%            Main Document                 %
+%========================================%
+
+\documentclass[11pt]{article}
+
+% --- Preamble ---
+\input{preamble/packages}
+\input{preamble/macros}
+
+%========================================%
+\title{Your Paper Title Goes Here}
+\author{First Author \and Second Author}
+\date{}
+
+\begin{document}
+\maketitle
+
+% --- Abstract ---
+\input{abstract}
+
+% --- Chapters ---
+\input{chapters/introduction}
+\input{chapters/method}
+\input{chapters/experiment}
+\input{chapters/discussion}
+\input{chapters/conclusion}
+
+% --- Bibliography ---
+\bibliographystyle{plainnat}
+\bibliography{refs/refs}
+
+\end{document}
