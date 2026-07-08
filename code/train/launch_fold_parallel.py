@@ -133,6 +133,7 @@ def normalize_extra_args(extra_args: Sequence[str]) -> List[str]:
 
 def summarize_metrics(fold_df: pd.DataFrame) -> pd.DataFrame:
     group_cols = [col for col in ("method", "model_name", "encoders") if col in fold_df.columns]
+    summary_cols = [col for col in ("method",) if col in fold_df.columns]
     rows = []
     if group_cols:
         groups = fold_df.groupby(group_cols, dropna=False)
@@ -143,12 +144,13 @@ def summarize_metrics(fold_df: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(keys, tuple):
             keys = (keys,)
         key_values = dict(zip(group_cols, keys)) if group_cols else {}
+        summary_key_values = {col: key_values[col] for col in summary_cols if col in key_values}
         for metric in METRICS:
             if metric not in group.columns:
                 continue
             values = pd.to_numeric(group[metric], errors="coerce")
             rows.append({
-                **key_values,
+                **summary_key_values,
                 "metric": metric,
                 "mean": float(values.mean(skipna=True)),
                 "std": float(values.std(skipna=True, ddof=1)) if values.notna().sum() > 1 else 0.0,
@@ -159,7 +161,7 @@ def summarize_metrics(fold_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def aggregate_subruns(subrun_dirs: Sequence[Path], launch_dir: Path) -> None:
+def aggregate_subruns(subrun_dirs: Sequence[Path], launch_dir: Path, train_run_dir: Path | None = None) -> None:
     rows = []
     subrun_rows = []
     for run_dir in subrun_dirs:
@@ -178,7 +180,11 @@ def aggregate_subruns(subrun_dirs: Sequence[Path], launch_dir: Path) -> None:
     fold_df = pd.concat(rows, ignore_index=True)
     fold_df.to_csv(launch_dir / "parallel_fold_metrics.csv", index=False, encoding="utf-8-sig", float_format="%.6f")
     summary_df = summarize_metrics(fold_df)
-    summary_df.to_csv(launch_dir / "parallel_summary_metrics.csv", index=False, encoding="utf-8-sig", float_format="%.6f")
+    summary_df.to_csv(launch_dir / "parallel_summary_metrics.csv", index=False, encoding="utf-8-sig", float_format="%.2f")
+    if train_run_dir is not None:
+        train_run_dir.mkdir(parents=True, exist_ok=True)
+        fold_df.to_csv(train_run_dir / "fold_metrics.csv", index=False, encoding="utf-8-sig", float_format="%.6f")
+        summary_df.to_csv(train_run_dir / "summary_metrics.csv", index=False, encoding="utf-8-sig", float_format="%.2f")
 
 
 def main() -> None:
@@ -273,7 +279,7 @@ def main() -> None:
         else:
             print(f"[Done] GPU {gpu_id}, folds {folds}")
 
-    aggregate_subruns(expected_subrun_dirs, launch_dir)
+    aggregate_subruns(expected_subrun_dirs, launch_dir, train_run_dir)
 
     if failures:
         raise RuntimeError(f"Some fold-parallel jobs failed: {failures}. Logs are in {launch_dir}")

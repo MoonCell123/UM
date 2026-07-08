@@ -143,7 +143,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-col", default="d3m3")
     parser.add_argument("--folds", type=int, nargs="*", default=None, help="Fold ids to run. Default: all folds.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--gpu-id", type=int, default=None, help="CUDA device index used when --device is 'cuda'.")
 
     parser.add_argument("--target-dim", type=int, default=512)
     parser.add_argument("--projection-dropout", type=float, default=0.0)
@@ -267,6 +268,24 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def resolve_device(args: argparse.Namespace) -> torch.device:
+    device_name = str(args.device).lower()
+    if device_name.startswith("cuda"):
+        if not torch.cuda.is_available():
+            print("[Warning] CUDA requested but unavailable. Falling back to CPU.")
+            args.device = "cpu"
+            return torch.device("cpu")
+        if args.gpu_id is not None and device_name == "cuda":
+            args.device = f"cuda:{int(args.gpu_id)}"
+        device = torch.device(args.device)
+        if device.index is not None:
+            torch.cuda.set_device(device)
+        return device
+    if device_name != "cpu":
+        raise ValueError(f"Unsupported device: {args.device}. Use 'cpu', 'cuda', or 'cuda:<index>'.")
+    return torch.device("cpu")
 
 
 def ensure_manifest(args: argparse.Namespace) -> Path:
@@ -1003,7 +1022,7 @@ def summarize_metrics(fold_rows: List[Mapping[str, object]], output_dir: Path) -
         output_dir / "summary_metrics.csv",
         index=False,
         encoding="utf-8-sig",
-        float_format="%.6f",
+        float_format="%.2f",
     )
 
 
@@ -1448,10 +1467,7 @@ def run_fold(
 
 def main() -> None:
     args = parse_args()
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("[Warning] CUDA requested but unavailable. Falling back to CPU.")
-        args.device = "cpu"
-    device = torch.device(args.device)
+    device = resolve_device(args)
     seed_everything(args.seed)
 
     manifest_path = ensure_manifest(args)
@@ -1482,6 +1498,8 @@ def main() -> None:
     print(f"Clinical: {args.clinical_path}")
     print(f"Folds: {folds}")
     print(f"Device: {device}")
+    if device.type == "cuda":
+        print(f"CUDA device: {torch.cuda.current_device()} | {torch.cuda.get_device_name(device)}")
     print(f"Output: {output_dir}")
     print()
 
