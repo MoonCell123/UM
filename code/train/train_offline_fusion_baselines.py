@@ -144,7 +144,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--folds", type=int, nargs="*", default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--gpu-id", type=int, default=None, help="CUDA device index used when --device is 'cuda'.")
 
     parser.add_argument("--target-dim", type=int, default=512)
     parser.add_argument("--projection-dropout", type=float, default=0.0)
@@ -199,6 +200,24 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def resolve_device(args: argparse.Namespace) -> torch.device:
+    device_name = str(args.device).lower()
+    if device_name.startswith("cuda"):
+        if not torch.cuda.is_available():
+            print("[Warning] CUDA requested but unavailable. Falling back to CPU.")
+            args.device = "cpu"
+            return torch.device("cpu")
+        if args.gpu_id is not None and device_name == "cuda":
+            args.device = f"cuda:{int(args.gpu_id)}"
+        device = torch.device(args.device)
+        if device.index is not None:
+            torch.cuda.set_device(device)
+        return device
+    if device_name != "cpu":
+        raise ValueError(f"Unsupported device: {args.device}. Use 'cpu', 'cuda', or 'cuda:<index>'.")
+    return torch.device("cpu")
 
 
 def stable_name_offset(name: str) -> int:
@@ -730,10 +749,13 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
         return
 
     group_cols = ["method", "model_name", "encoders"]
+    summary_cols = ["method"]
     metric_cols = ["auc", "auprc", "sensitivity", "specificity", "accuracy", "f1", "precision", "recall"]
+    summary_rows = []
     for keys, group in fold_df.groupby(group_cols, dropna=False):
         key_values = keys if isinstance(keys, tuple) else (keys,)
         key_dict = dict(zip(group_cols, key_values))
+        summary_key_dict = {col: key_dict[col] for col in summary_cols if col in key_dict}
         model_dir = output_dir / str(key_dict["model_name"])
         model_dir.mkdir(parents=True, exist_ok=True)
         group = group.sort_values("fold")
@@ -743,7 +765,7 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
         for metric in metric_cols:
             values = pd.to_numeric(group[metric], errors="coerce")
             rows.append({
-                **key_dict,
+                **summary_key_dict,
                 "metric": metric,
                 "mean": float(values.mean(skipna=True)),
                 "std": float(values.std(skipna=True, ddof=1)) if values.notna().sum() > 1 else 0.0,
@@ -751,20 +773,25 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
                 "median": float(values.median(skipna=True)),
                 "max": float(values.max(skipna=True)),
             })
+        summary_rows.extend(rows)
         pd.DataFrame(rows).to_csv(
             model_dir / "summary_metrics.csv",
             index=False,
             encoding="utf-8-sig",
-            float_format="%.6f",
+            float_format="%.2f",
         )
+
+    pd.DataFrame(summary_rows).to_csv(
+        output_dir / "summary_metrics.csv",
+        index=False,
+        encoding="utf-8-sig",
+        float_format="%.2f",
+    )
 
 
 def main() -> None:
     args = parse_args()
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("[Warning] CUDA requested but unavailable. Falling back to CPU.")
-        args.device = "cpu"
-    device = torch.device(args.device)
+    device = resolve_device(args)
     seed_everything(args.seed)
 
     manifest_path = ensure_manifest(args)
@@ -797,6 +824,8 @@ def main() -> None:
     print(f"Methods: {methods}")
     print(f"Folds: {folds}")
     print(f"Device: {device}")
+    if device.type == "cuda":
+        print(f"CUDA device: {torch.cuda.current_device()} | {torch.cuda.get_device_name(device)}")
     print(f"Output: {output_dir}")
 
     fold_rows: List[Mapping[str, object]] = []
