@@ -19,6 +19,7 @@ import json
 import random
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -71,8 +72,6 @@ class EvalResult:
     auc: float
     auprc: float
     threshold: float
-    sensitivity: float
-    specificity: float
     accuracy: float
     f1: float
     precision: float
@@ -165,6 +164,9 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--max-patches", type=int, default=0, help="Random train patch cap per WSI. 0 = all patches.")
     parser.add_argument("--eval-max-patches", type=int, default=0, help="Deterministic val patch cap per WSI. 0 = all patches.")
+    parser.add_argument("--profile-samples", type=int, default=3, help="Validation WSIs used for FLOPs/time profiling. 0 disables FLOPs/time profiling.")
+    parser.add_argument("--profile-warmup", type=int, default=1, help="Warmup forward passes before timing.")
+    parser.add_argument("--profile-repeat", type=int, default=3, help="Timed repeats per profiled WSI.")
     config = load_config_file(config_args.config)
     if config:
         valid_dests = {action.dest for action in parser._actions}
@@ -520,6 +522,133 @@ def move_features(features: Mapping[str, torch.Tensor], device: torch.device) ->
     return {name: value.float().to(device) for name, value in features.items()}
 
 
+class OfflineProfileWrapper(nn.Module):
+    """Traceable inference wrapper for offline baseline profiling."""
+
+    def __init__(self, model: nn.Module, encoder_names: Sequence[str]):
+        super().__init__()
+        self.model = model
+        self.encoder_names = list(encoder_names)
+
+    def forward(self, *feature_tensors: torch.Tensor) -> torch.Tensor:
+        raw_features = {
+            name: tensor
+            for name, tensor in zip(self.encoder_names, feature_tensors)
+        }
+        logits, _ = self.model(raw_features)
+        return logits
+
+
+def count_parameters(model: nn.Module) -> int:
+    return int(sum(param.numel() for param in model.parameters()))
+
+
+def cuda_synchronize_if_needed(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+@torch.no_grad()
+def collect_profile_inputs(
+    dataset: MultiEncoderSlideDataset,
+    device: torch.device,
+    max_samples: int,
+) -> List[Dict[str, torch.Tensor]]:
+    samples = []
+    for idx in range(min(max(int(max_samples), 0), len(dataset))):
+        raw_features, _, _ = dataset[idx]
+        samples.append(move_features(raw_features, device))
+    return samples
+
+
+def profile_sample_tuples(
+    samples: Sequence[Mapping[str, torch.Tensor]],
+    encoder_names: Sequence[str],
+) -> List[Tuple[torch.Tensor, ...]]:
+    return [
+        tuple(raw_features[name] for name in encoder_names)
+        for raw_features in samples
+    ]
+
+
+def estimate_fvcore_flops(wrapper: nn.Module, samples: Sequence[Tuple[torch.Tensor, ...]]) -> float:
+    if not samples:
+        return float("nan")
+    try:
+        from fvcore.nn import FlopCountAnalysis
+    except ImportError:
+        return float("nan")
+
+    values = []
+    was_training = wrapper.training
+    wrapper.eval()
+    try:
+        for feature_tensors in samples:
+            try:
+                values.append(float(FlopCountAnalysis(wrapper, feature_tensors).total()))
+            except Exception:
+                values.append(float("nan"))
+    finally:
+        wrapper.train(was_training)
+
+    finite = [value for value in values if np.isfinite(value)]
+    return float(np.mean(finite)) if finite else float("nan")
+
+
+@torch.no_grad()
+def measure_forward_time_seconds(
+    wrapper: nn.Module,
+    samples: Sequence[Tuple[torch.Tensor, ...]],
+    device: torch.device,
+    warmup: int,
+    repeat: int,
+) -> float:
+    if not samples or repeat <= 0:
+        return float("nan")
+    was_training = wrapper.training
+    wrapper.eval()
+    try:
+        for _ in range(max(int(warmup), 0)):
+            for feature_tensors in samples:
+                wrapper(*feature_tensors)
+        cuda_synchronize_if_needed(device)
+        start = time.perf_counter()
+        for _ in range(int(repeat)):
+            for feature_tensors in samples:
+                wrapper(*feature_tensors)
+        cuda_synchronize_if_needed(device)
+        elapsed = time.perf_counter() - start
+    finally:
+        wrapper.train(was_training)
+    return float(elapsed / (int(repeat) * len(samples)))
+
+
+def profile_offline_efficiency(
+    model: nn.Module,
+    dataset: MultiEncoderSlideDataset,
+    device: torch.device,
+    profile_samples: int,
+    profile_warmup: int,
+    profile_repeat: int,
+) -> Dict[str, float]:
+    parameters = count_parameters(model)
+    raw_samples = collect_profile_inputs(dataset, device, profile_samples)
+    encoder_names = (
+        list(model.encoder_names)
+        if hasattr(model, "encoder_names")
+        else [str(model.encoder_name)]
+    )
+    profile_inputs = profile_sample_tuples(raw_samples, encoder_names)
+    wrapper = OfflineProfileWrapper(model, encoder_names).to(device)
+    flops = estimate_fvcore_flops(wrapper, profile_inputs)
+    inference_time = measure_forward_time_seconds(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
+    return {
+        "parameters": float(parameters),
+        "flops": float(flops),
+        "inference_time_seconds": float(inference_time),
+    }
+
+
 def youden_threshold(labels: np.ndarray, probs: np.ndarray, fallback: float = 0.5) -> float:
     if np.unique(labels).size < 2:
         return float(fallback)
@@ -538,8 +667,6 @@ def compute_metrics(labels: Sequence[int], probs: Sequence[float], fallback_thre
     threshold = youden_threshold(labels_np, probs_np, fallback=fallback_threshold)
     preds_np = (probs_np >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(labels_np, preds_np, labels=[0, 1]).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) else np.nan
-    specificity = tn / (tn + fp) if (tn + fp) else np.nan
     try:
         auc = roc_auc_score(labels_np, probs_np)
     except ValueError:
@@ -552,8 +679,6 @@ def compute_metrics(labels: Sequence[int], probs: Sequence[float], fallback_thre
         auc=float(auc),
         auprc=float(auprc),
         threshold=float(threshold),
-        sensitivity=float(sensitivity),
-        specificity=float(specificity),
         accuracy=float(accuracy_score(labels_np, preds_np)),
         f1=float(f1_score(labels_np, preds_np, zero_division=0)),
         precision=float(precision_score(labels_np, preds_np, zero_division=0)),
@@ -605,9 +730,18 @@ def evaluate(model: nn.Module, dataset: MultiEncoderSlideDataset, device: torch.
     return metrics, pred_df
 
 
-def save_fold_outputs(fold_dir: Path, method_name: str, metrics: EvalResult, predictions: pd.DataFrame) -> None:
+def save_fold_outputs(
+    fold_dir: Path,
+    method_name: str,
+    metrics: EvalResult,
+    predictions: pd.DataFrame,
+    efficiency: Mapping[str, float] | None = None,
+) -> None:
     fold_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{**{"method": method_name}, **asdict(metrics)}]).to_csv(
+    metric_row = {**{"method": method_name}, **asdict(metrics)}
+    if efficiency:
+        metric_row.update(dict(efficiency))
+    pd.DataFrame([metric_row]).to_csv(
         fold_dir / "metrics.csv",
         index=False,
         encoding="utf-8-sig",
@@ -685,7 +819,7 @@ def train_fold(
         print(
             f"{model_name} | Fold {fold} | Epoch {epoch:03d}/{args.max_epochs} | "
             f"loss={train_loss:.4f} | AUC={metrics.auc:.4f} | AUPRC={metrics.auprc:.4f} | "
-            f"Sens={metrics.sensitivity:.4f} | Spec={metrics.specificity:.4f}"
+            f"ACC={metrics.accuracy:.4f} | F1={metrics.f1:.4f}"
         )
 
         improved = not np.isnan(metrics.auc) and metrics.auc > best_auc
@@ -716,7 +850,15 @@ def train_fold(
         payload = torch.load(best_path, map_location=device)
         model.load_state_dict(payload["state_dict"])
     final_metrics, final_pred = evaluate(model, val_ds, device, args.threshold)
-    save_fold_outputs(fold_dir, model_name, final_metrics, final_pred)
+    efficiency = profile_offline_efficiency(
+        model=model,
+        dataset=val_ds,
+        device=device,
+        profile_samples=args.profile_samples,
+        profile_warmup=args.profile_warmup,
+        profile_repeat=args.profile_repeat,
+    )
+    save_fold_outputs(fold_dir, model_name, final_metrics, final_pred, efficiency=efficiency)
     if best_metrics is None:
         best_metrics = final_metrics
 
@@ -728,6 +870,7 @@ def train_fold(
         "n_val": len(val_ds),
         "encoders": ",".join(encoder_names),
         **asdict(final_metrics),
+        **efficiency,
     }
 
 
@@ -749,13 +892,11 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
         return
 
     group_cols = ["method", "model_name", "encoders"]
-    summary_cols = ["method"]
-    metric_cols = ["auc", "auprc", "sensitivity", "specificity", "accuracy", "f1", "precision", "recall"]
+    metric_cols = ["auc", "auprc", "accuracy", "f1", "precision", "recall", "parameters", "flops", "inference_time_seconds"]
     summary_rows = []
     for keys, group in fold_df.groupby(group_cols, dropna=False):
         key_values = keys if isinstance(keys, tuple) else (keys,)
         key_dict = dict(zip(group_cols, key_values))
-        summary_key_dict = {col: key_dict[col] for col in summary_cols if col in key_dict}
         model_dir = output_dir / str(key_dict["model_name"])
         model_dir.mkdir(parents=True, exist_ok=True)
         group = group.sort_values("fold")
@@ -765,7 +906,7 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
         for metric in metric_cols:
             values = pd.to_numeric(group[metric], errors="coerce")
             rows.append({
-                **summary_key_dict,
+                **key_dict,
                 "metric": metric,
                 "mean": float(values.mean(skipna=True)),
                 "std": float(values.std(skipna=True, ddof=1)) if values.notna().sum() > 1 else 0.0,
@@ -778,14 +919,14 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
             model_dir / "summary_metrics.csv",
             index=False,
             encoding="utf-8-sig",
-            float_format="%.2f",
+            float_format="%.6f",
         )
 
     pd.DataFrame(summary_rows).to_csv(
         output_dir / "summary_metrics.csv",
         index=False,
         encoding="utf-8-sig",
-        float_format="%.2f",
+        float_format="%.6f",
     )
 
 
