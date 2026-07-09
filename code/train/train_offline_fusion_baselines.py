@@ -577,21 +577,27 @@ def estimate_fvcore_flops(wrapper: nn.Module, samples: Sequence[Tuple[torch.Tens
     try:
         from fvcore.nn import FlopCountAnalysis
     except ImportError:
+        print("[Warning] fvcore is not installed; FLOPs will be written as NaN.")
         return float("nan")
 
     values = []
     was_training = wrapper.training
     wrapper.eval()
+    first_error = None
     try:
         for feature_tensors in samples:
             try:
                 values.append(float(FlopCountAnalysis(wrapper, feature_tensors).total()))
-            except Exception:
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
                 values.append(float("nan"))
     finally:
         wrapper.train(was_training)
 
     finite = [value for value in values if np.isfinite(value)]
+    if not finite and first_error is not None:
+        print(f"[Warning] fvcore FLOPs tracing failed; FLOPs will be written as NaN. First error: {first_error}")
     return float(np.mean(finite)) if finite else float("nan")
 
 
@@ -643,9 +649,9 @@ def profile_offline_efficiency(
     flops = estimate_fvcore_flops(wrapper, profile_inputs)
     inference_time = measure_forward_time_seconds(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
     return {
-        "parameters": float(parameters),
-        "flops": float(flops),
-        "inference_time_seconds": float(inference_time),
+        "parameters": round(float(parameters) / 1_000_000.0, 2),
+        "flops": round(float(flops) / 1_000_000.0, 2),
+        "inference_time": round(float(inference_time) * 1000.0, 3),
     }
 
 
@@ -892,7 +898,7 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
         return
 
     group_cols = ["method", "model_name", "encoders"]
-    metric_cols = ["auc", "auprc", "accuracy", "f1", "precision", "recall", "parameters", "flops", "inference_time_seconds"]
+    metric_cols = ["auc", "auprc", "accuracy", "f1", "precision", "recall", "parameters", "flops", "inference_time"]
     summary_rows = []
     for keys, group in fold_df.groupby(group_cols, dropna=False):
         key_values = keys if isinstance(keys, tuple) else (keys,)
@@ -905,6 +911,17 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
         rows = []
         for metric in metric_cols:
             values = pd.to_numeric(group[metric], errors="coerce")
+            if values.notna().sum() == 0:
+                rows.append({
+                    **key_dict,
+                    "metric": metric,
+                    "mean": np.nan,
+                    "std": np.nan,
+                    "min": np.nan,
+                    "median": np.nan,
+                    "max": np.nan,
+                })
+                continue
             rows.append({
                 **key_dict,
                 "metric": metric,

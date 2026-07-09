@@ -48,7 +48,7 @@ threshold: 0.5
 replacement_strategy: "mean"
 gaussian_std_scale: 1.0
 beacon_constraint_weight: 0.05
-routing_temperature: 0.5
+routing_temperature: 0.3
 routing_logit_scale: 1.0
 
 max_patches: 0
