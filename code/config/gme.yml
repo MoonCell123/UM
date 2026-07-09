@@ -54,4 +54,7 @@ routing_logit_scale: 1.0
 max_patches: 0
 eval_max_patches: 0
 baseline_max_patches: 0
+profile_samples: 10
+profile_warmup: 10
+profile_repeat: 20
 save_fused_h5: false

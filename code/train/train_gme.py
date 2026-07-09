@@ -7,7 +7,7 @@ This script is intentionally self-contained for server runs:
 3. Rebuild train-only replacement baselines from the current projection space.
 4. Build a train-only static Beacon as a global semantic prior.
 5. Train GME with intervention attribution plus a Beacon constraint loss.
-6. Report AUC, AUPRC, sensitivity, specificity, and save checkpoints/artifacts.
+6. Report AUC, AUPRC, efficiency metrics, and save checkpoints/artifacts.
 
 The intervention score is computed as the prediction drop after replacing one
 encoder's projected embeddings, using mean-fusion prediction as the attribution
@@ -23,6 +23,7 @@ import math
 import random
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -76,8 +77,6 @@ class EvalResult:
     auc: float
     auprc: float
     threshold: float
-    sensitivity: float
-    specificity: float
     accuracy: float
     f1: float
     precision: float
@@ -239,6 +238,9 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Optional patch cap when building train replacement baselines. 0 means use all train patches.",
     )
+    parser.add_argument("--profile-samples", type=int, default=3, help="Validation WSIs used for FLOPs/time profiling. 0 disables FLOPs/time profiling.")
+    parser.add_argument("--profile-warmup", type=int, default=1, help="Warmup forward passes before timing.")
+    parser.add_argument("--profile-repeat", type=int, default=3, help="Timed repeats per profiled WSI.")
     parser.add_argument("--save-fused-h5", action="store_true", help="Export validation fused h5 embeddings.")
     # Backward-compatible no-op arguments for older config files.
     parser.add_argument("--skip-routing-lambda-analysis", action="store_true", help=argparse.SUPPRESS)
@@ -593,6 +595,152 @@ def move_features(features: Mapping[str, torch.Tensor], device: torch.device) ->
     return {name: tensor.float().to(device) for name, tensor in features.items()}
 
 
+class GMEProfileWrapper(nn.Module):
+    """Traceable inference wrapper for final GME forward profiling."""
+
+    def __init__(
+        self,
+        model: GMEModel,
+        baselines: Mapping[str, Mapping[str, torch.Tensor]],
+        replacement_strategy: str,
+        gaussian_std_scale: float,
+        encoder_names: Sequence[str],
+    ):
+        super().__init__()
+        self.model = model
+        self.baselines = baselines
+        self.replacement_strategy = replacement_strategy
+        self.gaussian_std_scale = float(gaussian_std_scale)
+        self.encoder_names = list(encoder_names)
+
+    def forward(self, *feature_tensors: torch.Tensor) -> torch.Tensor:
+        raw_features = {
+            name: tensor
+            for name, tensor in zip(self.encoder_names, feature_tensors)
+        }
+        logits, *_ = self.model.forward_stage2(
+            raw_features=raw_features,
+            baselines=self.baselines,
+            replacement_strategy=self.replacement_strategy,
+            gaussian_std_scale=self.gaussian_std_scale,
+        )
+        return logits
+
+
+def count_parameters(model: nn.Module) -> int:
+    return int(sum(param.numel() for param in model.parameters()))
+
+
+def cuda_synchronize_if_needed(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+@torch.no_grad()
+def collect_profile_inputs(
+    dataset: MultiEncoderSlideDataset,
+    device: torch.device,
+    max_samples: int,
+) -> List[Dict[str, torch.Tensor]]:
+    samples = []
+    for idx in range(min(max(int(max_samples), 0), len(dataset))):
+        raw_features, _, _ = dataset[idx]
+        samples.append(move_features(raw_features, device))
+    return samples
+
+
+def profile_sample_tuples(
+    samples: Sequence[Mapping[str, torch.Tensor]],
+    encoder_names: Sequence[str],
+) -> List[Tuple[torch.Tensor, ...]]:
+    return [
+        tuple(raw_features[name] for name in encoder_names)
+        for raw_features in samples
+    ]
+
+
+def estimate_fvcore_flops(wrapper: nn.Module, samples: Sequence[Tuple[torch.Tensor, ...]]) -> float:
+    if not samples:
+        return float("nan")
+    try:
+        from fvcore.nn import FlopCountAnalysis
+    except ImportError:
+        return float("nan")
+
+    values = []
+    was_training = wrapper.training
+    wrapper.eval()
+    try:
+        for feature_tensors in samples:
+            try:
+                values.append(float(FlopCountAnalysis(wrapper, feature_tensors).total()))
+            except Exception:
+                values.append(float("nan"))
+    finally:
+        wrapper.train(was_training)
+
+    finite = [value for value in values if np.isfinite(value)]
+    return float(np.mean(finite)) if finite else float("nan")
+
+
+@torch.no_grad()
+def measure_forward_time_seconds(
+    wrapper: nn.Module,
+    samples: Sequence[Tuple[torch.Tensor, ...]],
+    device: torch.device,
+    warmup: int,
+    repeat: int,
+) -> float:
+    if not samples or repeat <= 0:
+        return float("nan")
+    was_training = wrapper.training
+    wrapper.eval()
+    try:
+        for _ in range(max(int(warmup), 0)):
+            for feature_tensors in samples:
+                wrapper(*feature_tensors)
+        cuda_synchronize_if_needed(device)
+        start = time.perf_counter()
+        for _ in range(int(repeat)):
+            for feature_tensors in samples:
+                wrapper(*feature_tensors)
+        cuda_synchronize_if_needed(device)
+        elapsed = time.perf_counter() - start
+    finally:
+        wrapper.train(was_training)
+    return float(elapsed / (int(repeat) * len(samples)))
+
+
+def profile_gme_efficiency(
+    model: GMEModel,
+    dataset: MultiEncoderSlideDataset,
+    device: torch.device,
+    baselines: Mapping[str, Mapping[str, torch.Tensor]],
+    replacement_strategy: str,
+    gaussian_std_scale: float,
+    profile_samples: int,
+    profile_warmup: int,
+    profile_repeat: int,
+) -> Dict[str, float]:
+    parameters = count_parameters(model)
+    raw_samples = collect_profile_inputs(dataset, device, profile_samples)
+    profile_inputs = profile_sample_tuples(raw_samples, model.encoder_names)
+    wrapper = GMEProfileWrapper(
+        model,
+        baselines,
+        replacement_strategy,
+        gaussian_std_scale,
+        model.encoder_names,
+    ).to(device)
+    flops = estimate_fvcore_flops(wrapper, profile_inputs)
+    inference_time = measure_forward_time_seconds(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
+    return {
+        "parameters": float(parameters),
+        "flops": float(flops),
+        "inference_time_seconds": float(inference_time),
+    }
+
+
 def set_projection_trainable(model: GMEModel, trainable: bool) -> None:
     for param in model.projection_heads.parameters():
         param.requires_grad_(trainable)
@@ -628,8 +776,6 @@ def compute_metrics(labels: Sequence[int], probs: Sequence[float], fallback_thre
     preds_np = (probs_np >= threshold).astype(int)
 
     tn, fp, fn, tp = confusion_matrix(labels_np, preds_np, labels=[0, 1]).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) else np.nan
-    specificity = tn / (tn + fp) if (tn + fp) else np.nan
     try:
         auc = roc_auc_score(labels_np, probs_np)
     except ValueError:
@@ -643,8 +789,6 @@ def compute_metrics(labels: Sequence[int], probs: Sequence[float], fallback_thre
         auc=float(auc),
         auprc=float(auprc),
         threshold=float(threshold),
-        sensitivity=float(sensitivity),
-        specificity=float(specificity),
         accuracy=float(accuracy_score(labels_np, preds_np)),
         f1=float(f1_score(labels_np, preds_np, zero_division=0)),
         precision=float(precision_score(labels_np, preds_np, zero_division=0)),
@@ -974,9 +1118,13 @@ def save_fold_outputs(
     metrics: EvalResult,
     predictions: pd.DataFrame,
     weights: pd.DataFrame | None = None,
+    efficiency: Mapping[str, float] | None = None,
 ) -> None:
     fold_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{**{"stage": stage_name}, **asdict(metrics)}]).to_csv(
+    metric_row = {**{"stage": stage_name}, **asdict(metrics)}
+    if efficiency:
+        metric_row.update(dict(efficiency))
+    pd.DataFrame([metric_row]).to_csv(
         fold_dir / f"{stage_name}_metrics.csv",
         index=False,
         encoding="utf-8-sig",
@@ -1008,7 +1156,7 @@ def summarize_metrics(fold_rows: List[Mapping[str, object]], output_dir: Path) -
     fold_df.to_csv(output_dir / "fold_metrics.csv", index=False, encoding="utf-8-sig", float_format="%.6f")
 
     summary_rows = []
-    for metric in ["auc", "auprc", "sensitivity", "specificity", "accuracy", "f1", "precision", "recall"]:
+    for metric in ["auc", "auprc", "accuracy", "f1", "precision", "recall", "parameters", "flops", "inference_time_seconds"]:
         values = pd.to_numeric(fold_df[metric], errors="coerce")
         summary_rows.append({
             "metric": metric,
@@ -1022,7 +1170,7 @@ def summarize_metrics(fold_rows: List[Mapping[str, object]], output_dir: Path) -
         output_dir / "summary_metrics.csv",
         index=False,
         encoding="utf-8-sig",
-        float_format="%.2f",
+        float_format="%.6f",
     )
 
 
@@ -1329,7 +1477,7 @@ def run_fold(
             f"Fold {fold} | Stage2 | Epoch {epoch:03d}/{args.stage2_epochs} | "
             f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | beacon={train_beacon_loss:.4f} | "
             f"AUC={val_metrics.auc:.4f} | AUPRC={val_metrics.auprc:.4f} | "
-            f"Sens={val_metrics.sensitivity:.4f} | Spec={val_metrics.specificity:.4f} | "
+            f"ACC={val_metrics.accuracy:.4f} | F1={val_metrics.f1:.4f} | "
             f"I_min={score_stats['attribution_min']:.4f} | I_max={score_stats['attribution_max']:.4f}"
         )
 
@@ -1451,7 +1599,18 @@ def run_fold(
         fallback_threshold=args.threshold,
         fused_output_dir=fused_dir,
     )
-    save_fold_outputs(fold_dir, "final", final_metrics, final_pred, final_weights)
+    efficiency = profile_gme_efficiency(
+        model=model,
+        dataset=val_ds,
+        device=device,
+        baselines=baselines,
+        replacement_strategy=args.replacement_strategy,
+        gaussian_std_scale=args.gaussian_std_scale,
+        profile_samples=args.profile_samples,
+        profile_warmup=args.profile_warmup,
+        profile_repeat=args.profile_repeat,
+    )
+    save_fold_outputs(fold_dir, "final", final_metrics, final_pred, final_weights, efficiency=efficiency)
 
     with open(fold_dir / "routing_stats.json", "w", encoding="utf-8") as f:
         json.dump(model.router.get_routing_stats(), f, indent=2)
@@ -1461,6 +1620,7 @@ def run_fold(
         "n_train": len(train_ds),
         "n_val": len(val_ds),
         **asdict(final_metrics),
+        **efficiency,
     }
     return row
 
