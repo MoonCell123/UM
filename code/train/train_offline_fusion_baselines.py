@@ -654,7 +654,7 @@ def profile_offline_efficiency(
     inference_time = measure_forward_time_seconds(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
     return {
         "parameters": round(float(parameters) / 1_000_000.0, 2),
-        "flops": round(float(flops) / 1_000_000.0, 2),
+        "flops": round(float(flops) / 1_000_000_000.0, 2),
         "inference_time": round(float(inference_time) * 1000.0, 3),
     }
 
