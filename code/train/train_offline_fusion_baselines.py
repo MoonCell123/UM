@@ -587,7 +587,11 @@ def estimate_fvcore_flops(wrapper: nn.Module, samples: Sequence[Tuple[torch.Tens
     try:
         for feature_tensors in samples:
             try:
-                values.append(float(FlopCountAnalysis(wrapper, feature_tensors).total()))
+                analysis = FlopCountAnalysis(wrapper, feature_tensors)
+                analysis.unsupported_ops_warnings(False)
+                analysis.uncalled_modules_warnings(False)
+                analysis.tracer_warnings("none")
+                values.append(float(analysis.total()))
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
