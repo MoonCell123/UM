@@ -39,7 +39,7 @@ DEFAULT_OUTPUT_DIRS = {
     "gme": PROJECT_ROOT / "output" / "GME",
     "offline": PROJECT_ROOT / "output" / "Offline_Fusion_Baselines",
 }
-METRICS = ("auc", "auprc", "accuracy", "f1", "precision", "recall", "parameters", "flops", "inference_time_seconds")
+METRICS = ("auc", "auprc", "accuracy", "f1", "precision", "recall", "parameters", "flops", "inference_time")
 
 
 def parse_args() -> argparse.Namespace:
