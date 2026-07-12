@@ -1,18 +1,10 @@
 \begin{abstract}
 Recent pathology foundation models have achieved remarkable performance across
-diverse pathology tasks. However, different foundation models capture distinct 
-morphological and semantic patterns, while a single model may fail to fully 
-characterize complex pathological features. Fusing heterogeneous
-representations from multiple foundation models can leverage their complementary
-information and achieve more comprehensive pathological representation.
-Existing fusion strategies mainly rely on feature concatenation
-or uniform aggregation, implicitly assuming that all foundation models contribute
-equally and contain complementary information. However, representations from 
-different foundation models may exhibit substantial redundancy, and their individual
-contributions remain unclear. Although attention-based fusion methods enable adaptive
-weighting, the learned weights lack explicit interpretability regarding the
-importance of each foundation model. To address these limitations, we propose
-[Method Name], an adaptive fusion mechanism for integrating multiple foundation models.
+diverse pathology tasks. However, existing fusion strategies for integrating multiple
+foundation models typically rely on feature concatenation or uniform aggregation,
+overlooking the heterogeneous contributions and substantial redundancy among 
+different representations, while attention-based approaches provide limited interpretability regarding model importance.
+To address these limitations, we propose [Method Name], an adaptive fusion mechanism for integrating multiple foundation models.
 First, we estimate the contribution of each foundation model through an 
 intervention-based strategy, providing an explicit measurement of model importance.
 Second, we introduce a global semantic prior to regularize representation fusion and guide feature integration.
@@ -20,5 +12,5 @@ Third, we develop [Another Score] to capture the complementary relationship amon
 We evaluate our method on the TCGA-UVM, [other datasets].
 [results].
 Our approach demonstrates the effectiveness of interpretable and adaptive multi-foundation-model fusion for pathology representation learning.
-
+The code is available at [URL]
 \end{abstract}
