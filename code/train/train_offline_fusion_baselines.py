@@ -160,7 +160,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Fallback decision threshold if train-split Youden estimation is unavailable.",
+    )
 
     parser.add_argument("--max-patches", type=int, default=0, help="Random train patch cap per WSI. 0 = all patches.")
     parser.add_argument("--eval-max-patches", type=int, default=0, help="Deterministic val patch cap per WSI. 0 = all patches.")
@@ -671,10 +676,12 @@ def youden_threshold(labels: np.ndarray, probs: np.ndarray, fallback: float = 0.
     return float(thresholds[int(np.argmax(youden))])
 
 
-def compute_metrics(labels: Sequence[int], probs: Sequence[float], fallback_threshold: float = 0.5) -> EvalResult:
+def compute_metrics(labels: Sequence[int], probs: Sequence[float], decision_threshold: float) -> EvalResult:
     labels_np = np.asarray(labels, dtype=int)
     probs_np = np.asarray(probs, dtype=float)
-    threshold = youden_threshold(labels_np, probs_np, fallback=fallback_threshold)
+    threshold = float(decision_threshold)
+    if not np.isfinite(threshold):
+        raise ValueError(f"decision_threshold must be finite, got {threshold}")
     preds_np = (probs_np >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(labels_np, preds_np, labels=[0, 1]).ravel()
     try:
@@ -722,7 +729,30 @@ def train_one_epoch(model: nn.Module, dataset: MultiEncoderSlideDataset, optimiz
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, dataset: MultiEncoderSlideDataset, device: torch.device, fallback_threshold: float) -> Tuple[EvalResult, pd.DataFrame]:
+def estimate_decision_threshold(
+    model: nn.Module,
+    dataset: MultiEncoderSlideDataset,
+    device: torch.device,
+    fallback_threshold: float,
+) -> float:
+    """Estimate a Youden threshold from the train split only."""
+    model.eval()
+    labels, probs = [], []
+    for idx in range(len(dataset)):
+        raw_features, label, _ = dataset[idx]
+        raw_features = move_features(raw_features, device)
+        logits, _ = model(raw_features)
+        labels.append(int(label))
+        probs.append(float(torch.softmax(logits, dim=1)[0, 1].detach().cpu()))
+    return youden_threshold(
+        np.asarray(labels, dtype=int),
+        np.asarray(probs, dtype=float),
+        fallback=fallback_threshold,
+    )
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, dataset: MultiEncoderSlideDataset, device: torch.device, decision_threshold: float) -> Tuple[EvalResult, pd.DataFrame]:
     model.eval()
     labels, probs, rows = [], [], []
     for idx in range(len(dataset)):
@@ -733,7 +763,7 @@ def evaluate(model: nn.Module, dataset: MultiEncoderSlideDataset, device: torch.
         labels.append(int(label))
         probs.append(prob)
         rows.append({"slide_id": slide_id, "label": int(label), "prob_class1": prob})
-    metrics = compute_metrics(labels, probs, fallback_threshold=fallback_threshold)
+    metrics = compute_metrics(labels, probs, decision_threshold=decision_threshold)
     pred_df = pd.DataFrame(rows)
     pred_df["threshold"] = metrics.threshold
     pred_df["pred"] = (pred_df["prob_class1"] >= metrics.threshold).astype(int)
@@ -803,6 +833,16 @@ def train_fold(
         max_patches=args.eval_max_patches,
         training=False,
     )
+    threshold_ds = MultiEncoderSlideDataset(
+        manifest=manifest,
+        fold=fold,
+        split="train",
+        clinical_df=clinical_df,
+        label_col=args.label_col,
+        encoder_names=encoder_names,
+        max_patches=args.max_patches,
+        training=False,
+    )
 
     seed_everything(args.seed + fold + stable_name_offset(model_name))
     if method == "no_fusion":
@@ -829,7 +869,7 @@ def train_fold(
         print(
             f"{model_name} | Fold {fold} | Epoch {epoch:03d}/{args.max_epochs} | "
             f"loss={train_loss:.4f} | AUC={metrics.auc:.4f} | AUPRC={metrics.auprc:.4f} | "
-            f"ACC={metrics.accuracy:.4f} | F1={metrics.f1:.4f}"
+            f"ACC@{args.threshold:g}={metrics.accuracy:.4f} | F1@{args.threshold:g}={metrics.f1:.4f}"
         )
 
         improved = not np.isnan(metrics.auc) and metrics.auc > best_auc
@@ -859,7 +899,19 @@ def train_fold(
     if best_path.exists():
         payload = torch.load(best_path, map_location=device)
         model.load_state_dict(payload["state_dict"])
-    final_metrics, final_pred = evaluate(model, val_ds, device, args.threshold)
+    decision_threshold = estimate_decision_threshold(model, threshold_ds, device, args.threshold)
+    print(f"{model_name} | fold {fold}: train-derived Youden decision threshold={decision_threshold:.6f}")
+    with open(fold_dir / "decision_threshold.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "threshold": float(decision_threshold),
+                "source": "train_split_youden",
+                "fallback_threshold": float(args.threshold),
+            },
+            f,
+            indent=2,
+        )
+    final_metrics, final_pred = evaluate(model, val_ds, device, decision_threshold)
     efficiency = profile_offline_efficiency(
         model=model,
         dataset=val_ds,
@@ -907,6 +959,7 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
     for keys, group in fold_df.groupby(group_cols, dropna=False):
         key_values = keys if isinstance(keys, tuple) else (keys,)
         key_dict = dict(zip(group_cols, key_values))
+        summary_key_dict = {"method": key_dict["method"]}
         model_dir = output_dir / str(key_dict["model_name"])
         model_dir.mkdir(parents=True, exist_ok=True)
         group = group.sort_values("fold")
@@ -917,7 +970,7 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
             values = pd.to_numeric(group[metric], errors="coerce")
             if values.notna().sum() == 0:
                 rows.append({
-                    **key_dict,
+                    **summary_key_dict,
                     "metric": metric,
                     "mean": np.nan,
                     "std": np.nan,
@@ -927,7 +980,7 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
                 })
                 continue
             rows.append({
-                **key_dict,
+                **summary_key_dict,
                 "metric": metric,
                 "mean": float(values.mean(skipna=True)),
                 "std": float(values.std(skipna=True, ddof=1)) if values.notna().sum() > 1 else 0.0,
@@ -940,14 +993,14 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
             model_dir / "summary_metrics.csv",
             index=False,
             encoding="utf-8-sig",
-            float_format="%.6f",
+            float_format="%.2f",
         )
 
     pd.DataFrame(summary_rows).to_csv(
         output_dir / "summary_metrics.csv",
         index=False,
         encoding="utf-8-sig",
-        float_format="%.6f",
+        float_format="%.2f",
     )
 
 

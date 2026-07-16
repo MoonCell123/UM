@@ -197,7 +197,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-stage2", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Fallback decision threshold if train-split Youden estimation is unavailable.",
+    )
 
     parser.add_argument("--replacement-strategy", choices=["mean", "zero", "gaussian"], default="mean")
     parser.add_argument("--gaussian-std-scale", type=float, default=1.0)
@@ -438,6 +443,19 @@ class MultiEncoderSlideDataset:
         return tensor_features, label, slide_id
 
 
+def class_logit_margin(logits: torch.Tensor, class_index: int) -> torch.Tensor:
+    """Return one-vs-rest logit margin for the selected class."""
+    if logits.ndim != 2 or logits.shape[1] < 2:
+        raise ValueError(f"Expected logits shaped [batch, classes>=2], got {tuple(logits.shape)}")
+    if not 0 <= class_index < logits.shape[1]:
+        raise IndexError(f"class_index={class_index} is out of range for {logits.shape[1]} classes")
+    other_logits = torch.cat(
+        [logits[:, :class_index], logits[:, class_index + 1:]],
+        dim=1,
+    )
+    return logits[:, class_index] - torch.logsumexp(other_logits, dim=1)
+
+
 class GMEModel(nn.Module):
     """ProjectionHead + attribution router + ABMIL classifier."""
 
@@ -543,7 +561,6 @@ class GMEModel(nn.Module):
         self,
         projected: Mapping[str, torch.Tensor],
         baselines: Mapping[str, Mapping[str, torch.Tensor]],
-        class_index: int = 1,
         replacement_strategy: str = "mean",
         gaussian_std_scale: float = 1.0,
     ) -> torch.Tensor:
@@ -554,7 +571,8 @@ class GMEModel(nn.Module):
         try:
             with torch.no_grad():
                 full_logits, _ = self.forward_mean_fusion(projected)
-                full_score = torch.softmax(full_logits, dim=1)[0, class_index]
+                predicted_class = int(full_logits.argmax(dim=1)[0].item())
+                full_score = class_logit_margin(full_logits, predicted_class)[0]
                 scores = []
                 for name in self.encoder_names:
                     replaced = replace_encoder_embedding(
@@ -565,7 +583,7 @@ class GMEModel(nn.Module):
                         gaussian_std_scale=gaussian_std_scale,
                     )
                     masked_logits, _ = self.forward_mean_fusion(replaced)
-                    masked_score = torch.softmax(masked_logits, dim=1)[0, class_index]
+                    masked_score = class_logit_margin(masked_logits, predicted_class)[0]
                     scores.append(full_score - masked_score)
         finally:
             self.classifier.train(classifier_was_training)
@@ -779,10 +797,12 @@ def youden_threshold(labels: np.ndarray, probs: np.ndarray, fallback: float = 0.
     return float(thresholds[int(np.argmax(youden))])
 
 
-def compute_metrics(labels: Sequence[int], probs: Sequence[float], fallback_threshold: float = 0.5) -> EvalResult:
+def compute_metrics(labels: Sequence[int], probs: Sequence[float], decision_threshold: float) -> EvalResult:
     labels_np = np.asarray(labels, dtype=int)
     probs_np = np.asarray(probs, dtype=float)
-    threshold = youden_threshold(labels_np, probs_np, fallback=fallback_threshold)
+    threshold = float(decision_threshold)
+    if not np.isfinite(threshold):
+        raise ValueError(f"decision_threshold must be finite, got {threshold}")
     preds_np = (probs_np >= threshold).astype(int)
 
     tn, fp, fn, tp = confusion_matrix(labels_np, preds_np, labels=[0, 1]).ravel()
@@ -1062,6 +1082,37 @@ def train_stage2_epoch(
 
 
 @torch.no_grad()
+def estimate_stage2_decision_threshold(
+    model: GMEModel,
+    dataset: MultiEncoderSlideDataset,
+    device: torch.device,
+    baselines: Mapping[str, Mapping[str, torch.Tensor]],
+    replacement_strategy: str,
+    gaussian_std_scale: float,
+    fallback_threshold: float,
+) -> float:
+    """Estimate a Youden threshold from the train split only."""
+    model.eval()
+    labels, probs = [], []
+    for idx in range(len(dataset)):
+        raw_features, label, _ = dataset[idx]
+        raw_features = move_features(raw_features, device)
+        logits, *_ = model.forward_stage2(
+            raw_features=raw_features,
+            baselines=baselines,
+            replacement_strategy=replacement_strategy,
+            gaussian_std_scale=gaussian_std_scale,
+        )
+        labels.append(int(label))
+        probs.append(float(torch.softmax(logits, dim=1)[0, 1].detach().cpu()))
+    return youden_threshold(
+        np.asarray(labels, dtype=int),
+        np.asarray(probs, dtype=float),
+        fallback=fallback_threshold,
+    )
+
+
+@torch.no_grad()
 def evaluate_stage2(
     model: GMEModel,
     dataset: MultiEncoderSlideDataset,
@@ -1070,7 +1121,7 @@ def evaluate_stage2(
     beacon: torch.Tensor | None,
     replacement_strategy: str,
     gaussian_std_scale: float,
-    fallback_threshold: float,
+    decision_threshold: float,
     fused_output_dir: Path | None = None,
 ) -> Tuple[EvalResult, pd.DataFrame, pd.DataFrame]:
     model.eval()
@@ -1115,7 +1166,7 @@ def evaluate_stage2(
             with h5py.File(fused_output_dir / f"{slide_id}.h5", "w") as f:
                 f.create_dataset("features", data=fused, compression="gzip")
 
-    metrics = compute_metrics(labels, probs, fallback_threshold=fallback_threshold)
+    metrics = compute_metrics(labels, probs, decision_threshold=decision_threshold)
     pred_df = pd.DataFrame(rows)
     pred_df["threshold"] = metrics.threshold
     pred_df["pred"] = (pred_df["prob_class1"] >= metrics.threshold).astype(int)
@@ -1278,6 +1329,7 @@ def run_fold(
         max_patches=args.max_patches,
         training=False,
     )
+    threshold_ds = score_stats_ds
 
     if args.stage1_epochs <= 0 and args.freeze_projection_stage2:
         raise ValueError("--freeze-projection-stage2 requires --stage1-epochs > 0 so the ProjectionHead is not frozen randomly.")
@@ -1489,7 +1541,7 @@ def run_fold(
             beacon=beacon,
             replacement_strategy=args.replacement_strategy,
             gaussian_std_scale=args.gaussian_std_scale,
-            fallback_threshold=args.threshold,
+            decision_threshold=args.threshold,
         )
         scheduler2.step()
         stats = model.router.get_routing_stats()
@@ -1497,7 +1549,7 @@ def run_fold(
             f"Fold {fold} | Stage2 | Epoch {epoch:03d}/{args.stage2_epochs} | "
             f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | beacon={train_beacon_loss:.4f} | "
             f"AUC={val_metrics.auc:.4f} | AUPRC={val_metrics.auprc:.4f} | "
-            f"ACC={val_metrics.accuracy:.4f} | F1={val_metrics.f1:.4f} | "
+            f"ACC@{args.threshold:g}={val_metrics.accuracy:.4f} | F1@{args.threshold:g}={val_metrics.f1:.4f} | "
             f"I_min={score_stats['attribution_min']:.4f} | I_max={score_stats['attribution_max']:.4f}"
         )
 
@@ -1607,6 +1659,26 @@ def run_fold(
             gaussian_std_scale=args.gaussian_std_scale,
         )
 
+    decision_threshold = estimate_stage2_decision_threshold(
+        model=model,
+        dataset=threshold_ds,
+        device=device,
+        baselines=baselines,
+        replacement_strategy=args.replacement_strategy,
+        gaussian_std_scale=args.gaussian_std_scale,
+        fallback_threshold=args.threshold,
+    )
+    print(f"Fold {fold}: train-derived Youden decision threshold={decision_threshold:.6f}")
+    with open(fold_dir / "decision_threshold.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "threshold": float(decision_threshold),
+                "source": "train_split_youden",
+                "fallback_threshold": float(args.threshold),
+            },
+            f,
+            indent=2,
+        )
     fused_dir = fold_dir / "fused_val_h5" if args.save_fused_h5 else None
     final_metrics, final_pred, final_weights = evaluate_stage2(
         model=model,
@@ -1616,7 +1688,7 @@ def run_fold(
         beacon=beacon,
         replacement_strategy=args.replacement_strategy,
         gaussian_std_scale=args.gaussian_std_scale,
-        fallback_threshold=args.threshold,
+        decision_threshold=decision_threshold,
         fused_output_dir=fused_dir,
     )
     efficiency = profile_gme_efficiency(
