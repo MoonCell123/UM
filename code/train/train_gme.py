@@ -42,7 +42,6 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
-    roc_curve,
 )
 
 
@@ -201,7 +200,7 @@ def parse_args() -> argparse.Namespace:
         "--threshold",
         type=float,
         default=0.5,
-        help="Fallback decision threshold if train-split Youden estimation is unavailable.",
+        help="Fixed decision threshold used for every fold.",
     )
 
     parser.add_argument("--replacement-strategy", choices=["mean", "zero", "gaussian"], default="mean")
@@ -785,18 +784,6 @@ def reset_stage2_classifier(model: GMEModel, args: argparse.Namespace, device: t
     ).to(device)
 
 
-def youden_threshold(labels: np.ndarray, probs: np.ndarray, fallback: float = 0.5) -> float:
-    if np.unique(labels).size < 2:
-        return float(fallback)
-    fpr, tpr, thresholds = roc_curve(labels, probs)
-    finite = np.isfinite(thresholds)
-    if not finite.any():
-        return float(fallback)
-    fpr, tpr, thresholds = fpr[finite], tpr[finite], thresholds[finite]
-    youden = tpr - fpr
-    return float(thresholds[int(np.argmax(youden))])
-
-
 def compute_metrics(labels: Sequence[int], probs: Sequence[float], decision_threshold: float) -> EvalResult:
     labels_np = np.asarray(labels, dtype=int)
     probs_np = np.asarray(probs, dtype=float)
@@ -1082,37 +1069,6 @@ def train_stage2_epoch(
 
 
 @torch.no_grad()
-def estimate_stage2_decision_threshold(
-    model: GMEModel,
-    dataset: MultiEncoderSlideDataset,
-    device: torch.device,
-    baselines: Mapping[str, Mapping[str, torch.Tensor]],
-    replacement_strategy: str,
-    gaussian_std_scale: float,
-    fallback_threshold: float,
-) -> float:
-    """Estimate a Youden threshold from the train split only."""
-    model.eval()
-    labels, probs = [], []
-    for idx in range(len(dataset)):
-        raw_features, label, _ = dataset[idx]
-        raw_features = move_features(raw_features, device)
-        logits, *_ = model.forward_stage2(
-            raw_features=raw_features,
-            baselines=baselines,
-            replacement_strategy=replacement_strategy,
-            gaussian_std_scale=gaussian_std_scale,
-        )
-        labels.append(int(label))
-        probs.append(float(torch.softmax(logits, dim=1)[0, 1].detach().cpu()))
-    return youden_threshold(
-        np.asarray(labels, dtype=int),
-        np.asarray(probs, dtype=float),
-        fallback=fallback_threshold,
-    )
-
-
-@torch.no_grad()
 def evaluate_stage2(
     model: GMEModel,
     dataset: MultiEncoderSlideDataset,
@@ -1148,12 +1104,16 @@ def evaluate_stage2(
 
         weights = routed.weights.detach().cpu().reshape(-1).numpy()
         attr_np = attr.detach().cpu().reshape(-1).numpy()
+        c_range = float(routed.attribution_range.detach().cpu().reshape(-1).item())
+        tau = float(routed.tau.detach().cpu().reshape(-1).item())
         for encoder, weight, attr_value in zip(routed.encoder_names, weights, attr_np):
             weight_rows.append({
                 "slide_id": slide_id,
                 "encoder": encoder,
                 "weight": float(weight),
                 "attribution": float(attr_value),
+                "c_range": c_range,
+                "tau": tau,
                 "beacon_similarity": (
                     float(beacon_sims[encoder].detach().cpu())
                     if encoder in beacon_sims
@@ -1329,8 +1289,6 @@ def run_fold(
         max_patches=args.max_patches,
         training=False,
     )
-    threshold_ds = score_stats_ds
-
     if args.stage1_epochs <= 0 and args.freeze_projection_stage2:
         raise ValueError("--freeze-projection-stage2 requires --stage1-epochs > 0 so the ProjectionHead is not frozen randomly.")
     if args.stage1_epochs > 0 and args.stage1_beacon_mode == "none" and args.stage1_consistency_weight <= 0:
@@ -1659,22 +1617,13 @@ def run_fold(
             gaussian_std_scale=args.gaussian_std_scale,
         )
 
-    decision_threshold = estimate_stage2_decision_threshold(
-        model=model,
-        dataset=threshold_ds,
-        device=device,
-        baselines=baselines,
-        replacement_strategy=args.replacement_strategy,
-        gaussian_std_scale=args.gaussian_std_scale,
-        fallback_threshold=args.threshold,
-    )
-    print(f"Fold {fold}: train-derived Youden decision threshold={decision_threshold:.6f}")
+    decision_threshold = float(args.threshold)
+    print(f"Fold {fold}: fixed decision threshold={decision_threshold:.6f}")
     with open(fold_dir / "decision_threshold.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "threshold": float(decision_threshold),
-                "source": "train_split_youden",
-                "fallback_threshold": float(args.threshold),
+                "source": "fixed_config",
             },
             f,
             indent=2,
