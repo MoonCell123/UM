@@ -38,7 +38,6 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
-    roc_curve,
 )
 
 
@@ -164,7 +163,7 @@ def parse_args() -> argparse.Namespace:
         "--threshold",
         type=float,
         default=0.5,
-        help="Fallback decision threshold if train-split Youden estimation is unavailable.",
+        help="Fixed decision threshold used for every fold.",
     )
 
     parser.add_argument("--max-patches", type=int, default=0, help="Random train patch cap per WSI. 0 = all patches.")
@@ -664,18 +663,6 @@ def profile_offline_efficiency(
     }
 
 
-def youden_threshold(labels: np.ndarray, probs: np.ndarray, fallback: float = 0.5) -> float:
-    if np.unique(labels).size < 2:
-        return float(fallback)
-    fpr, tpr, thresholds = roc_curve(labels, probs)
-    finite = np.isfinite(thresholds)
-    if not finite.any():
-        return float(fallback)
-    fpr, tpr, thresholds = fpr[finite], tpr[finite], thresholds[finite]
-    youden = tpr - fpr
-    return float(thresholds[int(np.argmax(youden))])
-
-
 def compute_metrics(labels: Sequence[int], probs: Sequence[float], decision_threshold: float) -> EvalResult:
     labels_np = np.asarray(labels, dtype=int)
     probs_np = np.asarray(probs, dtype=float)
@@ -726,29 +713,6 @@ def train_one_epoch(model: nn.Module, dataset: MultiEncoderSlideDataset, optimiz
         optimizer.step()
         total_loss += float(loss.detach().cpu())
     return total_loss / max(len(dataset), 1)
-
-
-@torch.no_grad()
-def estimate_decision_threshold(
-    model: nn.Module,
-    dataset: MultiEncoderSlideDataset,
-    device: torch.device,
-    fallback_threshold: float,
-) -> float:
-    """Estimate a Youden threshold from the train split only."""
-    model.eval()
-    labels, probs = [], []
-    for idx in range(len(dataset)):
-        raw_features, label, _ = dataset[idx]
-        raw_features = move_features(raw_features, device)
-        logits, _ = model(raw_features)
-        labels.append(int(label))
-        probs.append(float(torch.softmax(logits, dim=1)[0, 1].detach().cpu()))
-    return youden_threshold(
-        np.asarray(labels, dtype=int),
-        np.asarray(probs, dtype=float),
-        fallback=fallback_threshold,
-    )
 
 
 @torch.no_grad()
@@ -833,17 +797,6 @@ def train_fold(
         max_patches=args.eval_max_patches,
         training=False,
     )
-    threshold_ds = MultiEncoderSlideDataset(
-        manifest=manifest,
-        fold=fold,
-        split="train",
-        clinical_df=clinical_df,
-        label_col=args.label_col,
-        encoder_names=encoder_names,
-        max_patches=args.max_patches,
-        training=False,
-    )
-
     seed_everything(args.seed + fold + stable_name_offset(model_name))
     if method == "no_fusion":
         if len(input_dims) != 1:
@@ -899,14 +852,13 @@ def train_fold(
     if best_path.exists():
         payload = torch.load(best_path, map_location=device)
         model.load_state_dict(payload["state_dict"])
-    decision_threshold = estimate_decision_threshold(model, threshold_ds, device, args.threshold)
-    print(f"{model_name} | fold {fold}: train-derived Youden decision threshold={decision_threshold:.6f}")
+    decision_threshold = float(args.threshold)
+    print(f"{model_name} | fold {fold}: fixed decision threshold={decision_threshold:.6f}")
     with open(fold_dir / "decision_threshold.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "threshold": float(decision_threshold),
-                "source": "train_split_youden",
-                "fallback_threshold": float(args.threshold),
+                "source": "fixed_config",
             },
             f,
             indent=2,
