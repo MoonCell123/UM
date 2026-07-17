@@ -5,8 +5,9 @@ Baselines implemented here:
 1. no_fusion       : train ABMIL on one encoder at a time.
 2. mean            : per-encoder ProjectionHead -> mean over encoders -> ABMIL.
 3. concat          : per-encoder ProjectionHead -> concat -> linear reduction -> ABMIL.
-4. cross_attention : per-encoder ProjectionHead -> encoder-token cross attention -> ABMIL.
-5. self_attention  : per-encoder ProjectionHead -> encoder-token self attention -> ABMIL.
+4. gated           : WSI-level learned encoder gates -> weighted sum -> ABMIL.
+5. cross_attention : per-encoder ProjectionHead -> encoder-token cross attention -> ABMIL.
+6. self_attention  : per-encoder ProjectionHead -> encoder-token self attention -> ABMIL.
 
 These are conventional baselines for comparing against train_gme.py. They do
 not use Beacon, intervention attribution, or GME routing.
@@ -62,7 +63,7 @@ DEFAULT_FEATURE_DIRS = [
     "features_hoptimus0",
 ]
 FEATURE_KEYS = ("feats", "features")
-METHODS = ("mean", "concat", "cross_attention", "self_attention")
+METHODS = ("mean", "concat", "gated", "cross_attention", "self_attention")
 PATH_ARGS = ("manifest", "manifest_dir", "output_dir", "run_dir")
 
 
@@ -147,6 +148,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--target-dim", type=int, default=512)
     parser.add_argument("--projection-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--gated-pooling",
+        choices=["mean", "attention"],
+        default="mean",
+        help="Pool each encoder's full WSI bag before computing one gated weight per encoder.",
+    )
     parser.add_argument("--cross-attn-heads", type=int, default=4)
     parser.add_argument("--cross-attn-layers", type=int, default=1)
     parser.add_argument("--d-inner", type=int, default=256)
@@ -421,6 +428,47 @@ class CrossAttentionFusion(nn.Module):
         return x.mean(dim=1)
 
 
+class GatedFusion(nn.Module):
+    """Learn one normalized encoder-weight vector for the entire WSI bag."""
+
+    def __init__(self, dim: int = 512, pooling: str = "mean", eps: float = 1e-8):
+        super().__init__()
+        if pooling not in {"mean", "attention"}:
+            raise ValueError(f"Unsupported gated pooling: {pooling}")
+        self.pooling = pooling
+        self.patch_attention = (
+            nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.Tanh(),
+                nn.Linear(dim, 1),
+            )
+            if pooling == "attention"
+            else None
+        )
+        self.gate = nn.Linear(dim, 1)
+        self.eps = float(eps)
+        self.apply(initialize_projection_weights)
+
+    def forward(self, embeddings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # embeddings: [N_patches, M_encoders, D]
+        if embeddings.ndim != 3:
+            raise ValueError(
+                "GatedFusion expects [N_patches, M_encoders, D], "
+                f"got {tuple(embeddings.shape)}"
+            )
+        if self.pooling == "mean":
+            slide_embeddings = embeddings.mean(dim=0)
+        else:
+            patch_logits = self.patch_attention(embeddings)
+            patch_weights = torch.softmax(patch_logits, dim=0)
+            slide_embeddings = torch.sum(patch_weights * embeddings, dim=0)
+
+        gate_scores = torch.sigmoid(self.gate(slide_embeddings)).squeeze(-1)
+        weights = gate_scores / gate_scores.sum().clamp_min(self.eps)
+        fused = torch.sum(embeddings * weights.view(1, -1, 1), dim=1)
+        return fused, weights
+
+
 class SelfAttentionFusion(nn.Module):
     """Per-patch self-attention over encoder tokens followed by learned reduction."""
 
@@ -458,7 +506,7 @@ class ProjectedFusionABMIL(nn.Module):
 
     def __init__(self, method: str, input_dims: Mapping[str, int], args: argparse.Namespace):
         super().__init__()
-        if method not in {"mean", "concat", "cross_attention", "self_attention"}:
+        if method not in {"mean", "concat", "gated", "cross_attention", "self_attention"}:
             raise ValueError(f"Unsupported projected fusion method: {method}")
         self.method = method
         self.encoder_names = sorted(input_dims.keys())
@@ -475,6 +523,12 @@ class ProjectedFusionABMIL(nn.Module):
             self.concat_reduce.apply(initialize_projection_weights)
         else:
             self.concat_reduce = None
+
+        self.gated = (
+            GatedFusion(dim=args.target_dim, pooling=args.gated_pooling)
+            if method == "gated"
+            else None
+        )
 
         if method == "cross_attention":
             self.cross_attention = CrossAttentionFusion(
@@ -512,6 +566,9 @@ class ProjectedFusionABMIL(nn.Module):
             return torch.stack(tensors, dim=0).mean(dim=0)
         if self.method == "concat":
             return self.concat_reduce(torch.cat(tensors, dim=-1))
+        if self.method == "gated":
+            fused, _weights = self.gated(torch.stack(tensors, dim=1))
+            return fused
         if self.method == "cross_attention":
             return self.cross_attention(torch.stack(tensors, dim=1))
         if self.method == "self_attention":
