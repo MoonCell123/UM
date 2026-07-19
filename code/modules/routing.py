@@ -8,6 +8,7 @@ from typing import Dict, Iterable, Mapping, Sequence
 
 import torch
 import torch.nn as nn
+import math
 
 
 TensorDict = Mapping[str, torch.Tensor]
@@ -22,6 +23,8 @@ class RoutingOutput:
     adaptive_fused: torch.Tensor
     combined_scores: torch.Tensor
     normalized_attribution: torch.Tensor
+    attribution_range: torch.Tensor
+    tau: torch.Tensor
     encoder_names: Sequence[str]
 
 
@@ -184,22 +187,23 @@ class DualConsistencyRouter(nn.Module):
     def compute_weights(
         self,
         attribution_scores: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute routing weights from attribution logits.
-
-        The old sigmoid gate compressed min-max attribution into a very narrow
-        range. Here attribution directly forms the gate logits; temperature and
-        scale control how selective the router is.
         """
         norm_attr = minmax_with_global_stats(
             attribution_scores,
             minimum=self.attribution_min,
             maximum=self.attribution_max,
             eps=self.eps,
-        )
-        combined = norm_attr * self.routing_logit_scale / self.routing_temperature
+        ).clamp(0.0, 1.0)
+        c_range = (norm_attr.amax(dim=-1) - norm_attr.amin(dim=-1)).clamp(0.0, 1.0)
+        tau_min = 0.3
+        tau_max = 0.6
+        # inverse num of tau
+        tau = torch.clamp_min(tau_max / (1.0 + c_range), tau_min)
+        combined = norm_attr / tau.unsqueeze(-1)
         weights = torch.softmax(combined, dim=-1)
-        return weights, combined, norm_attr
+        return weights, combined, norm_attr, c_range, tau
 
     def forward(
         self,
@@ -214,7 +218,7 @@ class DualConsistencyRouter(nn.Module):
         attr = ensure_score_tensor(attribution_scores, names).to(
             device=next(iter(features_by_encoder.values())).device
         )
-        weights, combined, norm_attr = self.compute_weights(attr)
+        weights, combined, norm_attr, c_range, tau = self.compute_weights(attr)
         fused, adaptive_fused, names = dual_consistency_fusion(
             features_by_encoder=features_by_encoder,
             weights=weights,
@@ -227,5 +231,7 @@ class DualConsistencyRouter(nn.Module):
             adaptive_fused=adaptive_fused,
             combined_scores=combined,
             normalized_attribution=norm_attr,
+            attribution_range=c_range,
+            tau=tau,
             encoder_names=names,
         )
