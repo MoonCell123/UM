@@ -16,11 +16,12 @@ from typing import Dict, List, Sequence
 import h5py
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedGroupKFold
 
 
 DEFAULT_FEAT_BASE = Path(r"L:\20x_256px_0px_overlap")
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "output" / "Middle_Fusion_Manifests"
+DEFAULT_CLINICAL_PATH = Path(__file__).resolve().parents[2] / "clinical_information.csv"
 DEFAULT_FEATURE_DIRS = [
     "features_hoptimus1",
     "features_virchow",
@@ -38,7 +39,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-dirs", nargs="+", default=DEFAULT_FEATURE_DIRS)
     parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--clinical-path", type=Path, default=DEFAULT_CLINICAL_PATH)
+    parser.add_argument("--label-col", default="d3m3")
     return parser.parse_args()
+
+
+def patient_id_from_slide_id(slide_id: str) -> str:
+    """Return a patient-level identifier from a slide/sample identifier."""
+    parts = str(slide_id).split("-")
+    if len(parts) >= 3 and parts[0].upper() == "TCGA":
+        return "-".join(parts[:3])
+    return "-".join(parts[:-1]) if len(parts) > 1 else str(slide_id)
+
+
+def load_labels(clinical_path: Path, label_col: str) -> pd.DataFrame:
+    if clinical_path.suffix.lower() == ".csv":
+        clinical = pd.read_csv(clinical_path, encoding="utf-8-sig")
+    else:
+        clinical = pd.read_excel(clinical_path)
+    if "slide_id" not in clinical.columns:
+        raise ValueError(f"Clinical table must contain slide_id: {clinical_path}")
+    if label_col not in clinical.columns:
+        scna_col = "SCNA Cluster No."
+        if label_col != "d3m3" or scna_col not in clinical.columns:
+            raise ValueError(
+                f"Clinical table must contain {label_col!r}; could not derive it from {clinical_path}"
+            )
+        cluster = pd.to_numeric(clinical[scna_col], errors="coerce")
+        clinical[label_col] = cluster.map(lambda value: 0 if value in (1, 2) else 1 if value in (3, 4) else np.nan)
+    return clinical[["slide_id", label_col]].copy()
 
 
 def list_h5_slide_ids(feature_dir: Path) -> List[str]:
@@ -112,9 +141,19 @@ def main() -> None:
     if len(common_slide_ids) < args.cv_folds:
         raise ValueError(f"Need at least {args.cv_folds} common slides, got {len(common_slide_ids)}.")
 
+    labels_df = load_labels(args.clinical_path, args.label_col)
+    labels_df["slide_id"] = labels_df["slide_id"].astype(str)
+    labels_df = labels_df.dropna(subset=[args.label_col]).drop_duplicates("slide_id")
+    label_map = labels_df.set_index("slide_id")[args.label_col].astype(int).to_dict()
+    missing_labels = sorted(set(common_slide_ids) - set(label_map))
+    if missing_labels:
+        raise ValueError(f"Missing labels for {len(missing_labels)} common slides, e.g. {missing_labels[:5]}")
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    kfold = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
     slide_array = np.asarray(common_slide_ids)
+    slide_labels = np.asarray([label_map[str(slide_id)] for slide_id in slide_array], dtype=int)
+    patient_groups = np.asarray([patient_id_from_slide_id(str(slide_id)) for slide_id in slide_array])
+    splitter = StratifiedGroupKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
     all_rows = []
 
     print("=" * 80)
@@ -127,9 +166,15 @@ def main() -> None:
     print(f"Output dir: {args.output_dir}")
     print()
 
-    for fold, (train_idx, val_idx) in enumerate(kfold.split(slide_array), start=1):
+    for fold, (train_idx, val_idx) in enumerate(
+        splitter.split(slide_array, slide_labels, groups=patient_groups), start=1
+    ):
         train_ids = slide_array[train_idx].tolist()
         val_ids = slide_array[val_idx].tolist()
+        train_patients = {patient_id_from_slide_id(slide_id) for slide_id in train_ids}
+        val_patients = {patient_id_from_slide_id(slide_id) for slide_id in val_ids}
+        if train_patients & val_patients:
+            raise RuntimeError(f"Patient leakage in fold {fold}: {sorted(train_patients & val_patients)}")
         print(f"fold {fold}: train={len(train_ids)}, val={len(val_ids)}")
 
         fold_rows = []
@@ -148,6 +193,9 @@ def main() -> None:
         "feature_dirs": args.feature_dirs,
         "cv_folds": args.cv_folds,
         "seed": args.seed,
+        "label_col": args.label_col,
+        "splitter": "StratifiedGroupKFold",
+        "patient_id_policy": "TCGA first three fields; otherwise remove final sample field",
         "slide_source": "intersection of .h5 names in selected features_* directories",
         "projection_policy": "trainable ProjectionHead is used inside the model and optimized by classification loss",
         "common_slide_count": len(common_slide_ids),

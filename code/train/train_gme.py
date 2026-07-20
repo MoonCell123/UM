@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from torch.utils.data import Subset
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -193,6 +194,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--stage2-epochs", type=int, default=80)
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--inner-val-fraction", type=float, default=0.2)
     parser.add_argument("--lr-stage2", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--grad-clip", type=float, default=5.0)
@@ -276,6 +278,32 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def stratified_split_indices(
+    dataset: "MultiEncoderSlideDataset", val_fraction: float, seed: int
+) -> Tuple[List[int], List[int]]:
+    """Create a deterministic label-stratified split inside outer-train."""
+    labels = np.asarray(
+        [int(dataset.clinical.loc[sid, dataset.label_col]) for sid in dataset.slide_ids], dtype=int
+    )
+    rng = np.random.default_rng(int(seed))
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+    for label in sorted(np.unique(labels).tolist()):
+        indices = np.flatnonzero(labels == label).astype(int).tolist()
+        rng.shuffle(indices)
+        if len(indices) < 2:
+            train_indices.extend(indices)
+            continue
+        n_val = min(max(int(round(len(indices) * float(val_fraction))), 1), len(indices) - 1)
+        val_indices.extend(indices[:n_val])
+        train_indices.extend(indices[n_val:])
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    if not train_indices or not val_indices:
+        raise ValueError(f"Could not create inner split: train={len(train_indices)}, val={len(val_indices)}")
+    return train_indices, val_indices
+
+
 def resolve_device(args: argparse.Namespace) -> torch.device:
     device_name = str(args.device).lower()
     if device_name.startswith("cuda"):
@@ -300,12 +328,23 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
     if manifest_path.exists() and not args.build_manifest:
         requested = {str(item) for item in args.feature_dirs}
         existing = set(pd.read_csv(manifest_path, usecols=["feature_dir"])["feature_dir"].astype(str).unique())
-        if existing == requested:
+        metadata_path = Path(args.manifest_dir) / "middle_fusion_manifest_config.json"
+        metadata = {}
+        if metadata_path.exists():
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        manifest_is_stratified = (
+            metadata.get("splitter") == "StratifiedGroupKFold"
+            and metadata.get("label_col") == str(args.label_col)
+            and int(metadata.get("seed", -1)) == int(args.seed)
+        )
+        if existing == requested and manifest_is_stratified:
             return manifest_path
         print(
-            "\nExisting manifest feature_dirs do not match config; rebuilding manifest.\n"
+            "\nExisting manifest is missing the requested feature/split metadata; rebuilding manifest.\n"
             f"Existing: {sorted(existing)}\n"
-            f"Requested: {sorted(requested)}"
+            f"Requested: {sorted(requested)}\n"
+            f"Metadata: {metadata}"
         )
 
     output_dir = Path(args.manifest_dir)
@@ -322,6 +361,10 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
         str(args.cv_folds),
         "--seed",
         str(args.seed),
+        "--clinical-path",
+        str(args.clinical_path),
+        "--label-col",
+        str(args.label_col),
     ]
     print("\nBuilding middle-fusion manifest:")
     print("$ " + " ".join(command))
@@ -613,34 +656,26 @@ def move_features(features: Mapping[str, torch.Tensor], device: torch.device) ->
 
 
 class GMEProfileWrapper(nn.Module):
-    """Traceable inference wrapper for final GME forward profiling."""
+    """Traceable online Student inference with attribution supplied offline."""
 
     def __init__(
         self,
         model: GMEModel,
-        baselines: Mapping[str, Mapping[str, torch.Tensor]],
-        replacement_strategy: str,
-        gaussian_std_scale: float,
         encoder_names: Sequence[str],
     ):
         super().__init__()
         self.model = model
-        self.baselines = baselines
-        self.replacement_strategy = replacement_strategy
-        self.gaussian_std_scale = float(gaussian_std_scale)
         self.encoder_names = list(encoder_names)
 
     def forward(self, *feature_tensors: torch.Tensor) -> torch.Tensor:
+        attribution_scores = feature_tensors[-1]
         raw_features = {
             name: tensor
-            for name, tensor in zip(self.encoder_names, feature_tensors)
+            for name, tensor in zip(self.encoder_names, feature_tensors[:-1])
         }
-        logits, *_ = self.model.forward_stage2(
-            raw_features=raw_features,
-            baselines=self.baselines,
-            replacement_strategy=self.replacement_strategy,
-            gaussian_std_scale=self.gaussian_std_scale,
-        )
+        projected = self.model.project(raw_features)
+        routed = self.model.route_with_scores(projected, attribution_scores)
+        logits, _ = self.model.classifier(routed.fused)
         return logits
 
 
@@ -669,11 +704,17 @@ def collect_profile_inputs(
 def profile_sample_tuples(
     samples: Sequence[Mapping[str, torch.Tensor]],
     encoder_names: Sequence[str],
+    attribution_scores: Sequence[torch.Tensor] | None = None,
 ) -> List[Tuple[torch.Tensor, ...]]:
-    return [
+    feature_tuples = [
         tuple(raw_features[name] for name in encoder_names)
         for raw_features in samples
     ]
+    if attribution_scores is None:
+        return feature_tuples
+    if len(feature_tuples) != len(attribution_scores):
+        raise ValueError("Profile samples and attribution scores must have the same length.")
+    return [features + (scores,) for features, scores in zip(feature_tuples, attribution_scores)]
 
 
 def estimate_fvcore_flops(wrapper: nn.Module, samples: Sequence[Tuple[torch.Tensor, ...]]) -> float:
@@ -751,14 +792,27 @@ def profile_gme_efficiency(
 ) -> Dict[str, float]:
     parameters = count_parameters(model)
     raw_samples = collect_profile_inputs(dataset, device, profile_samples)
-    profile_inputs = profile_sample_tuples(raw_samples, model.encoder_names)
-    wrapper = GMEProfileWrapper(
-        model,
-        baselines,
-        replacement_strategy,
-        gaussian_std_scale,
-        model.encoder_names,
-    ).to(device)
+    # Attribution is an offline preprocessing product and is deliberately
+    # computed before FLOPs/timing.  The reported inference_time measures the
+    # same online boundary as fusion baselines: projection + fusion/router +
+    # classifier.
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        offline_scores = []
+        for raw_features in raw_samples:
+            projected = model.project(raw_features)
+            offline_scores.append(
+                model.intervention_attribution(
+                    projected=projected,
+                    baselines=baselines,
+                    replacement_strategy=replacement_strategy,
+                    gaussian_std_scale=gaussian_std_scale,
+                ).detach()
+            )
+    model.train(was_training)
+    profile_inputs = profile_sample_tuples(raw_samples, model.encoder_names, offline_scores)
+    wrapper = GMEProfileWrapper(model, model.encoder_names).to(device)
     flops = estimate_fvcore_flops(wrapper, profile_inputs)
     inference_time = measure_forward_time_seconds(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
     return {
@@ -1234,6 +1288,15 @@ def run_fold(
         max_patches=args.eval_max_patches,
         training=False,
     )
+    train_eval_ds = MultiEncoderSlideDataset(
+        manifest=manifest,
+        fold=fold,
+        split="train",
+        clinical_df=clinical_df,
+        label_col=args.label_col,
+        max_patches=args.eval_max_patches,
+        training=False,
+    )
     stage1_train_ds = MultiEncoderSlideDataset(
         manifest=manifest,
         fold=fold,
@@ -1246,7 +1309,7 @@ def run_fold(
     stage1_val_ds = MultiEncoderSlideDataset(
         manifest=manifest,
         fold=fold,
-        split="val",
+        split="train",
         clinical_df=clinical_df,
         label_col=args.label_col,
         max_patches=args.stage1_eval_max_patches,
@@ -1289,6 +1352,19 @@ def run_fold(
         max_patches=args.max_patches,
         training=False,
     )
+    inner_train_indices, inner_val_indices = stratified_split_indices(
+        train_ds, val_fraction=args.inner_val_fraction, seed=args.seed + fold
+    )
+    inner_train_ds = Subset(train_ds, inner_train_indices)
+    inner_val_ds = Subset(train_eval_ds, inner_val_indices)
+    inner_baseline_ds = Subset(baseline_ds, inner_train_indices)
+    inner_score_stats_ds = Subset(score_stats_ds, inner_train_indices)
+    inner_stage1_train_ds = Subset(stage1_train_ds, inner_train_indices)
+    inner_stage1_val_ds = Subset(stage1_val_ds, inner_val_indices)
+    print(
+        f"Fold {fold}: outer_train={len(train_ds)}, outer_test={len(val_ds)}, "
+        f"inner_train={len(inner_train_ds)}, inner_val={len(inner_val_ds)}"
+    )
     if args.stage1_epochs <= 0 and args.freeze_projection_stage2:
         raise ValueError("--freeze-projection-stage2 requires --stage1-epochs > 0 so the ProjectionHead is not frozen randomly.")
     if args.stage1_epochs > 0 and args.stage1_beacon_mode == "none" and args.stage1_consistency_weight <= 0:
@@ -1326,7 +1402,7 @@ def run_fold(
                 )
             train_loss, train_beacon_loss, train_consistency_loss = train_stage1_epoch(
                 model=model,
-                dataset=stage1_train_ds,
+                dataset=inner_stage1_train_ds,
                 optimizer=optimizer1,
                 device=device,
                 beacon=stage1_beacon,
@@ -1336,7 +1412,7 @@ def run_fold(
             )
             val_loss, val_beacon_loss, val_consistency_loss = evaluate_stage1_geometry(
                 model=model,
-                dataset=stage1_val_ds,
+                dataset=inner_stage1_val_ds,
                 device=device,
                 beacon=stage1_beacon,
                 beacon_constraint_weight=args.beacon_constraint_weight,
@@ -1418,6 +1494,10 @@ def run_fold(
         stage2_beacon_weight = float(args.beacon_constraint_weight)
         print("Stage2: ProjectionHead remains trainable; Beacon constraint stays active in Stage2.")
 
+    initial_stage2_state = {
+        name: value.detach().clone() for name, value in model.state_dict().items()
+    }
+
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     if not trainable_params:
         raise RuntimeError("No trainable parameters left for Stage2.")
@@ -1438,7 +1518,7 @@ def run_fold(
     if args.freeze_projection_stage2:
         static_beacon, static_beacon_summary, static_baselines, static_baseline_summary = build_beacon_and_baselines(
             model,
-            baseline_ds,
+            inner_baseline_ds,
             device,
             args.target_dim,
         )
@@ -1452,13 +1532,13 @@ def run_fold(
         else:
             beacon, beacon_summary, baselines, baseline_summary = build_beacon_and_baselines(
                 model,
-                baseline_ds,
+                inner_baseline_ds,
                 device,
                 args.target_dim,
             )
         score_stats = update_train_routing_score_stats(
             model=model,
-            dataset=score_stats_ds,
+            dataset=inner_score_stats_ds,
             device=device,
             baselines=baselines,
             replacement_strategy=args.replacement_strategy,
@@ -1466,7 +1546,7 @@ def run_fold(
         )
         train_loss, train_cls_loss, train_beacon_loss = train_stage2_epoch(
             model=model,
-            dataset=train_ds,
+            dataset=inner_train_ds,
             optimizer=optimizer2,
             device=device,
             baselines=baselines,
@@ -1479,13 +1559,13 @@ def run_fold(
         if not args.freeze_projection_stage2:
             beacon, beacon_summary, baselines, baseline_summary = build_beacon_and_baselines(
                 model,
-                baseline_ds,
+                inner_baseline_ds,
                 device,
                 args.target_dim,
             )
         score_stats = update_train_routing_score_stats(
             model=model,
-            dataset=score_stats_ds,
+            dataset=inner_score_stats_ds,
             device=device,
             baselines=baselines,
             replacement_strategy=args.replacement_strategy,
@@ -1493,7 +1573,7 @@ def run_fold(
         )
         val_metrics, val_pred, val_weights = evaluate_stage2(
             model=model,
-            dataset=val_ds,
+            dataset=inner_val_ds,
             device=device,
             baselines=baselines,
             beacon=beacon,
@@ -1506,7 +1586,7 @@ def run_fold(
         print(
             f"Fold {fold} | Stage2 | Epoch {epoch:03d}/{args.stage2_epochs} | "
             f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | beacon={train_beacon_loss:.4f} | "
-            f"AUC={val_metrics.auc:.4f} | AUPRC={val_metrics.auprc:.4f} | "
+            f"inner_AUC={val_metrics.auc:.4f} | inner_AUPRC={val_metrics.auprc:.4f} | "
             f"ACC@{args.threshold:g}={val_metrics.accuracy:.4f} | F1@{args.threshold:g}={val_metrics.f1:.4f} | "
             f"I_min={score_stats['attribution_min']:.4f} | I_max={score_stats['attribution_max']:.4f}"
         )
@@ -1577,37 +1657,40 @@ def run_fold(
             )
             baseline_summary.to_csv(fold_dir / "replacement_baseline_summary.csv", index=False, encoding="utf-8-sig")
             beacon_summary.to_csv(fold_dir / "static_beacon_summary.csv", index=False, encoding="utf-8-sig")
-            save_fold_outputs(fold_dir, "stage2", val_metrics, val_pred, val_weights)
+            save_fold_outputs(fold_dir, "inner_selection", val_metrics, val_pred, val_weights)
         else:
             no_improve += 1
             if no_improve >= args.patience:
-                print(f"Fold {fold}: early stopping at epoch {epoch}. Best Stage2 AUC={best_stage2_auc:.4f}")
+                print(f"Fold {fold}: early stopping at epoch {epoch}. Best inner Stage2 AUC={best_stage2_auc:.4f}")
                 break
 
-    if best_stage2_path.exists():
-        load_model_state(best_stage2_path, model, device)
-        payload_path = best_beacon_path if best_beacon_path.exists() else fold_dir / "replacement_baselines.pt"
-        baseline_payload = torch.load(payload_path, map_location=device)
-        baselines = {
-            name: {
-                key: value.to(device) if torch.is_tensor(value) else value
-                for key, value in stats.items()
-            }
-            for name, stats in baseline_payload["baselines"].items()
-        }
-        if "beacon" in baseline_payload:
-            beacon = baseline_payload["beacon"].to(device).float()
-        else:
-            beacon, _, _, _ = build_beacon_and_baselines(model, baseline_ds, device, args.target_dim)
-        if "routing_score_stats" in baseline_payload:
-            score_stats = baseline_payload["routing_score_stats"]
-            model.router.set_score_stats(
-                attribution_min=score_stats["attribution_min"],
-                attribution_max=score_stats["attribution_max"],
-                count=score_stats["count"],
+    if not best_stage2_path.exists():
+        raise RuntimeError(f"Fold {fold}: no Stage2 checkpoint was selected on inner validation.")
+
+    selected_payload = torch.load(best_stage2_path, map_location=device)
+    selected_epoch = int(selected_payload.get("epoch", 1))
+    model.load_state_dict(initial_stage2_state)
+    seed_everything(args.seed + fold)
+    retrain_optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=args.lr_stage2,
+        weight_decay=args.weight_decay,
+    )
+    retrain_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        retrain_optimizer,
+        T_max=max(selected_epoch, 1),
+        eta_min=args.lr_stage2 * 0.01,
+    )
+    static_outer = None
+    if args.freeze_projection_stage2:
+        static_outer = build_beacon_and_baselines(model, baseline_ds, device, args.target_dim)
+    for _ in range(selected_epoch):
+        if static_outer is None:
+            beacon, _, baselines, _ = build_beacon_and_baselines(
+                model, baseline_ds, device, args.target_dim
             )
-    else:
-        beacon, _, baselines, _ = build_beacon_and_baselines(model, baseline_ds, device, args.target_dim)
+        else:
+            beacon, _, baselines, _ = static_outer
         update_train_routing_score_stats(
             model=model,
             dataset=score_stats_ds,
@@ -1616,6 +1699,32 @@ def run_fold(
             replacement_strategy=args.replacement_strategy,
             gaussian_std_scale=args.gaussian_std_scale,
         )
+        train_stage2_epoch(
+            model=model,
+            dataset=train_ds,
+            optimizer=retrain_optimizer,
+            device=device,
+            baselines=baselines,
+            beacon=beacon,
+            beacon_constraint_weight=stage2_beacon_weight,
+            replacement_strategy=args.replacement_strategy,
+            gaussian_std_scale=args.gaussian_std_scale,
+            grad_clip=args.grad_clip,
+        )
+        retrain_scheduler.step()
+
+    beacon, _, baselines, _ = build_beacon_and_baselines(
+        model, baseline_ds, device, args.target_dim
+    )
+    update_train_routing_score_stats(
+        model=model,
+        dataset=score_stats_ds,
+        device=device,
+        baselines=baselines,
+        replacement_strategy=args.replacement_strategy,
+        gaussian_std_scale=args.gaussian_std_scale,
+    )
+    print(f"Fold {fold}: selected inner epoch={selected_epoch}; retrained on all outer-train slides.")
 
     decision_threshold = float(args.threshold)
     print(f"Fold {fold}: fixed decision threshold={decision_threshold:.6f}")
@@ -1652,6 +1761,18 @@ def run_fold(
         profile_repeat=args.profile_repeat,
     )
     save_fold_outputs(fold_dir, "final", final_metrics, final_pred, final_weights, efficiency=efficiency)
+    save_checkpoint(
+        best_stage2_path,
+        model,
+        selected_epoch,
+        final_metrics,
+        {
+            "input_dims": input_dims,
+            "stage": "stage2_retrained_outer_train",
+            "selection_policy": "inner_validation_AUC_then_retrain_on_outer_train",
+            "selected_inner_epoch": selected_epoch,
+        },
+    )
 
     with open(fold_dir / "routing_stats.json", "w", encoding="utf-8") as f:
         json.dump(model.router.get_routing_stats(), f, indent=2)
