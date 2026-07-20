@@ -16,6 +16,7 @@ not use Beacon, intervention attribution, or GME routing.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 import subprocess
@@ -25,6 +26,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Mapping, Sequence, Tuple
+from torch.utils.data import Subset
 
 import h5py
 import numpy as np
@@ -163,6 +165,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--max-epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--inner-val-fraction", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--grad-clip", type=float, default=5.0)
@@ -193,6 +196,8 @@ def parse_args() -> argparse.Namespace:
             setattr(args, name, Path(value))
     if args.clinical_path is None:
         raise ValueError("--clinical-path is required, either in CLI or config.")
+    if not 0.0 < args.inner_val_fraction < 1.0:
+        raise ValueError("--inner-val-fraction must be between 0 and 1.")
     return args
 
 
@@ -238,17 +243,49 @@ def stable_name_offset(name: str) -> int:
     return sum((idx + 1) * ord(char) for idx, char in enumerate(name)) % 10000
 
 
+def stratified_split_indices(dataset: MultiEncoderSlideDataset, val_fraction: float, seed: int) -> Tuple[List[int], List[int]]:
+    labels = np.asarray([int(dataset.clinical.loc[sid, dataset.label_col]) for sid in dataset.slide_ids], dtype=int)
+    rng = np.random.default_rng(int(seed))
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+    for label in sorted(np.unique(labels).tolist()):
+        indices = np.flatnonzero(labels == label).astype(int).tolist()
+        rng.shuffle(indices)
+        if len(indices) < 2:
+            train_indices.extend(indices)
+            continue
+        n_val = min(max(int(round(len(indices) * float(val_fraction))), 1), len(indices) - 1)
+        val_indices.extend(indices[:n_val])
+        train_indices.extend(indices[n_val:])
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    if not train_indices or not val_indices:
+        raise ValueError(f"Could not create inner split: train={len(train_indices)}, val={len(val_indices)}")
+    return train_indices, val_indices
+
+
 def ensure_manifest(args: argparse.Namespace) -> Path:
     manifest_path = Path(args.manifest)
     if manifest_path.exists() and not args.build_manifest:
         requested = {str(item) for item in args.feature_dirs}
         existing = set(pd.read_csv(manifest_path, usecols=["feature_dir"])["feature_dir"].astype(str).unique())
-        if existing == requested:
+        metadata_path = Path(args.manifest_dir) / "middle_fusion_manifest_config.json"
+        metadata = {}
+        if metadata_path.exists():
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        manifest_is_stratified = (
+            metadata.get("splitter") == "StratifiedGroupKFold"
+            and metadata.get("label_col") == str(args.label_col)
+            and int(metadata.get("seed", -1)) == int(args.seed)
+        )
+        if existing == requested and manifest_is_stratified:
             return manifest_path
         print(
-            "\nExisting manifest feature_dirs do not match config; rebuilding manifest.\n"
+            "\nExisting manifest is missing the requested feature/split metadata; rebuilding manifest.\n"
             f"Existing: {sorted(existing)}\n"
-            f"Requested: {sorted(requested)}"
+            f"Requested: {sorted(requested)}\n"
+            f"Metadata: {metadata}"
         )
 
     output_dir = Path(args.manifest_dir)
@@ -265,6 +302,10 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
         str(args.cv_folds),
         "--seed",
         str(args.seed),
+        "--clinical-path",
+        str(args.clinical_path),
+        "--label-col",
+        str(args.label_col),
     ]
     print("\nBuilding middle-fusion manifest:")
     print("$ " + " ".join(command))
@@ -396,7 +437,7 @@ class SingleEncoderABMIL(nn.Module):
 
 
 class CrossAttentionFusion(nn.Module):
-    """Per-patch cross-attention over encoder tokens."""
+    """Cross-attention from a learned fusion query to encoder tokens."""
 
     def __init__(self, dim: int, heads: int = 4, layers: int = 1, dropout: float = 0.0):
         super().__init__()
@@ -404,7 +445,8 @@ class CrossAttentionFusion(nn.Module):
             raise ValueError(f"target_dim={dim} must be divisible by cross_attn_heads={heads}.")
         self.layers = nn.ModuleList([
             nn.ModuleDict({
-                "norm1": nn.LayerNorm(dim),
+                "norm_q": nn.LayerNorm(dim),
+                "norm_kv": nn.LayerNorm(dim),
                 "attn": nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True),
                 "norm2": nn.LayerNorm(dim),
                 "ffn": nn.Sequential(
@@ -416,16 +458,24 @@ class CrossAttentionFusion(nn.Module):
             })
             for _ in range(layers)
         ])
+        self.queries = nn.ParameterList([
+            nn.Parameter(torch.empty(1, 1, dim)) for _ in range(layers)
+        ])
+        for query in self.queries:
+            nn.init.normal_(query, std=0.02)
         self.apply(initialize_projection_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [N_patches, M_encoders, D]
-        for layer in self.layers:
-            h = layer["norm1"](x)
-            attn_out, _ = layer["attn"](h, h, h, need_weights=False)
-            x = x + attn_out
-            x = x + layer["ffn"](layer["norm2"](x))
-        return x.mean(dim=1)
+        for layer, query_parameter in zip(self.layers, self.queries):
+            query = query_parameter.expand(x.shape[0], -1, -1)
+            attn_out, _ = layer["attn"](
+                layer["norm_q"](query), layer["norm_kv"](x), layer["norm_kv"](x), need_weights=False
+            )
+            fused = query + attn_out
+            fused = fused + layer["ffn"](layer["norm2"](fused))
+            x = x + fused.expand(-1, x.shape[1], -1)
+        return fused.squeeze(1)
 
 
 class GatedFusion(nn.Module):
@@ -854,7 +904,18 @@ def train_fold(
         max_patches=args.eval_max_patches,
         training=False,
     )
-    seed_everything(args.seed + fold + stable_name_offset(model_name))
+    train_eval_ds = MultiEncoderSlideDataset(
+        manifest=manifest,
+        fold=fold,
+        split="train",
+        clinical_df=clinical_df,
+        label_col=args.label_col,
+        encoder_names=encoder_names,
+        max_patches=args.max_patches,
+        training=False,
+    )
+    # Same fold seed across methods makes initialization and data-order RNG comparable.
+    seed_everything(args.seed + fold)
     if method == "no_fusion":
         if len(input_dims) != 1:
             raise ValueError("no_fusion expects exactly one encoder.")
@@ -863,28 +924,40 @@ def train_fold(
     else:
         model = ProjectedFusionABMIL(method, input_dims, args).to(device)
 
+    initial_state = copy.deepcopy(model.state_dict())
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.max_epochs, 1), eta_min=args.lr * 0.01)
     fold_dir = output_dir / model_name / f"fold_{fold}"
     best_path = fold_dir / "best_model.pt"
     best_auc = -np.inf
+    best_epoch = 0
     best_metrics: EvalResult | None = None
     no_improve = 0
+    inner_train_indices, inner_val_indices = stratified_split_indices(
+        train_ds, val_fraction=args.inner_val_fraction, seed=args.seed + fold
+    )
+    inner_train_ds = Subset(train_ds, inner_train_indices)
+    inner_val_ds = Subset(train_eval_ds, inner_val_indices)
 
-    print(f"\n{model_name} | fold {fold}: train={len(train_ds)}, val={len(val_ds)}, encoders={encoder_names}")
+    print(
+        f"\n{model_name} | fold {fold}: outer_train={len(train_ds)}, outer_val={len(val_ds)}, "
+        f"inner_train={len(inner_train_ds)}, inner_val={len(inner_val_ds)}, encoders={encoder_names}"
+    )
     for epoch in range(1, args.max_epochs + 1):
-        train_loss = train_one_epoch(model, train_ds, optimizer, device, args.grad_clip)
-        metrics, pred_df = evaluate(model, val_ds, device, args.threshold)
+        train_loss = train_one_epoch(model, inner_train_ds, optimizer, device, args.grad_clip)
+        metrics, _ = evaluate(model, inner_val_ds, device, args.threshold)
         scheduler.step()
         print(
             f"{model_name} | Fold {fold} | Epoch {epoch:03d}/{args.max_epochs} | "
-            f"loss={train_loss:.4f} | AUC={metrics.auc:.4f} | AUPRC={metrics.auprc:.4f} | "
+            f"loss={train_loss:.4f} | inner_AUC={metrics.auc:.4f} | inner_AUPRC={metrics.auprc:.4f} | "
             f"ACC@{args.threshold:g}={metrics.accuracy:.4f} | F1@{args.threshold:g}={metrics.f1:.4f}"
         )
 
         improved = not np.isnan(metrics.auc) and metrics.auc > best_auc
         if improved:
             best_auc = metrics.auc
+            best_epoch = epoch
             best_metrics = metrics
             no_improve = 0
             fold_dir.mkdir(parents=True, exist_ok=True)
@@ -896,10 +969,10 @@ def train_fold(
                     "fold": int(fold),
                     "input_dims": dict(input_dims),
                     "metrics": asdict(metrics),
+                    "epoch": int(epoch),
                 },
                 best_path,
             )
-            save_fold_outputs(fold_dir, model_name, metrics, pred_df)
         else:
             no_improve += 1
             if no_improve >= args.patience:
@@ -908,7 +981,25 @@ def train_fold(
 
     if best_path.exists():
         payload = torch.load(best_path, map_location=device)
-        model.load_state_dict(payload["state_dict"])
+        selected_epoch = int(payload.get("epoch", best_epoch))
+        model.load_state_dict(initial_state)
+        seed_everything(args.seed + fold)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(selected_epoch, 1), eta_min=args.lr * 0.01
+        )
+        for _ in range(selected_epoch):
+            train_one_epoch(model, train_ds, optimizer, device, args.grad_clip)
+            scheduler.step()
+        torch.save(
+            {
+                **payload,
+                "state_dict": model.state_dict(),
+                "epoch": selected_epoch,
+                "selection_policy": "inner_validation_AUC_then_retrain_on_outer_train",
+            },
+            best_path,
+        )
     decision_threshold = float(args.threshold)
     print(f"{model_name} | fold {fold}: fixed decision threshold={decision_threshold:.6f}")
     with open(fold_dir / "decision_threshold.json", "w", encoding="utf-8") as f:
