@@ -1,0 +1,21 @@
+# Config for code/evaluation/compute_linear_cka.py
+
+manifest: "output/Middle_Fusion_Manifests/middle_fusion_manifest.csv"
+output_dir: "output/Linear_CKA"
+
+feature_dirs:
+  - "features_gigapath"
+  - "features_hoptimus0"
+  - "features_hoptimus1"
+  - "features_uni_v1"
+  - "features_virchow"
+
+# 0 uses all coordinate-aligned patches. 1024 is a deterministic estimate.
+max_patches: 1024
+seed: 42
+device: "cuda:1"
+dtype: "float32"
+strict: false
+
+# Optional. Leave unset to process every complete WSI.
+# slide_ids: ["TCGA-XXXX-01A", "TCGA-YYYY-01A"]
