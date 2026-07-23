@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compute one coordinate-aligned Linear CKA matrix per WSI."
     )
+    parser.add_argument("--config", type=Path, default=None, help="YAML/JSON config file. CLI args override config.")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
@@ -62,6 +63,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Stop at the first invalid WSI instead of recording it in errors.csv.",
     )
+    # Parse config first, then let explicit CLI values override it.
+    config_probe, _ = parser.parse_known_args()
+    if config_probe.config is not None:
+        config_path = config_probe.config
+        if not config_path.exists():
+            candidate = PROJECT_ROOT / "code" / "config" / config_path
+            if candidate.exists():
+                config_path = candidate
+        if not config_path.exists():
+            parser.error(f"Config file not found: {config_probe.config}")
+        if config_path.suffix.lower() == ".json":
+            with open(config_path, "r", encoding="utf-8") as handle:
+                config = json.load(handle)
+        else:
+            try:
+                import yaml
+            except ImportError as exc:
+                parser.error(f"Reading YAML config requires PyYAML: {exc}")
+            with open(config_path, "r", encoding="utf-8") as handle:
+                config = yaml.safe_load(handle) or {}
+        if not isinstance(config, dict):
+            parser.error("CKA config must be a YAML/JSON mapping.")
+        normalized = {str(key).replace("-", "_"): value for key, value in config.items()}
+        parser.set_defaults(**normalized)
     args = parser.parse_args()
     if args.max_patches < 0:
         parser.error("--max-patches must be non-negative.")
