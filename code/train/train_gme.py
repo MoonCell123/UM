@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Subset
 from sklearn.metrics import (
     accuracy_score,
@@ -208,6 +209,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replacement-strategy", choices=["mean", "zero", "gaussian"], default="mean")
     parser.add_argument("--gaussian-std-scale", type=float, default=1.0)
     parser.add_argument(
+        "--attribution-target",
+        choices=["predicted_class", "class_1"],
+        default="predicted_class",
+        help=(
+            "Logit-margin direction used by intervention attribution. "
+            "'predicted_class' explains the current mean-fusion decision; "
+            "'class_1' uses z1-z0 for every sample."
+        ),
+    )
+    parser.add_argument(
+        "--interaction-pair-beta",
+        type=float,
+        default=0.1,
+        help="Scale of the signed pairwise residual added to the attribution-fused representation.",
+    )
+    parser.add_argument(
+        "--interaction-pair-weight-decay",
+        type=float,
+        default=0.01,
+        help="AdamW weight decay applied only to the interaction feature gate.",
+    )
+    parser.add_argument(
+        "--interaction-pair-lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for the zero-initialized interaction feature gate.",
+    )
+    parser.add_argument(
+        "--interaction-rms-clip",
+        type=float,
+        default=3.0,
+        help="Absolute clipping bound after train-only per-pair RMS scaling without centering.",
+    )
+    parser.add_argument(
         "--beacon-constraint-weight",
         type=float,
         default=0.05,
@@ -260,6 +295,16 @@ def parse_args() -> argparse.Namespace:
         parser.set_defaults(**config)
     args = parser.parse_args()
     args.config = config_args.config
+    if not 0.0 < float(args.inner_val_fraction) < 1.0:
+        raise ValueError("--inner-val-fraction must be between 0 and 1.")
+    if float(args.interaction_pair_beta) < 0.0:
+        raise ValueError("--interaction-pair-beta must be non-negative.")
+    if float(args.interaction_pair_weight_decay) < 0.0:
+        raise ValueError("--interaction-pair-weight-decay must be non-negative.")
+    if float(args.interaction_pair_lr) <= 0.0:
+        raise ValueError("--interaction-pair-lr must be positive.")
+    if float(args.interaction_rms_clip) <= 0.0:
+        raise ValueError("--interaction-rms-clip must be positive.")
     for name in PATH_ARGS:
         value = getattr(args, name, None)
         if value is not None and not isinstance(value, Path):
@@ -512,6 +557,9 @@ class GMEModel(nn.Module):
         droprate: float = 0.25,
         routing_temperature: float = 0.5,
         routing_logit_scale: float = 1.0,
+        attribution_target: str = "predicted_class",
+        interaction_pair_beta: float = 0.1,
+        interaction_rms_clip: float = 3.0,
     ):
         super().__init__()
         self.encoder_names = sorted(input_dims.keys())
@@ -533,6 +581,30 @@ class GMEModel(nn.Module):
             droprate=droprate,
         )
         self.target_dim = int(target_dim)
+        if attribution_target not in {"predicted_class", "class_1"}:
+            raise ValueError(
+                "attribution_target must be 'predicted_class' or 'class_1', "
+                f"got {attribution_target!r}"
+            )
+        if attribution_target == "class_1" and n_classes != 2:
+            raise ValueError("attribution_target='class_1' requires binary classification.")
+        self.attribution_target = attribution_target
+        if n_classes != 2:
+            raise ValueError("Interaction pairwise fusion currently requires binary classification.")
+        self.interaction_pair_beta = float(interaction_pair_beta)
+        self.interaction_rms_clip = float(interaction_rms_clip)
+        self.interaction_pairs = [
+            (i, j)
+            for i in range(len(self.encoder_names))
+            for j in range(i + 1, len(self.encoder_names))
+        ]
+        # One learnable value per projected feature dimension. Zero
+        # initialization starts exactly at the attribution-only baseline.
+        self.interaction_gate = nn.Parameter(torch.zeros(self.target_dim))
+        self.register_buffer("interaction_mean", torch.zeros(len(self.interaction_pairs)))
+        self.register_buffer("interaction_std", torch.ones(len(self.interaction_pairs)))
+        self.register_buffer("interaction_rms", torch.ones(len(self.interaction_pairs)))
+        self.register_buffer("interaction_stats_count", torch.tensor(0, dtype=torch.long))
 
     def project(self, raw_features: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return self.projection_heads(raw_features)
@@ -605,7 +677,18 @@ class GMEModel(nn.Module):
         baselines: Mapping[str, Mapping[str, torch.Tensor]],
         replacement_strategy: str = "mean",
         gaussian_std_scale: float = 1.0,
-    ) -> torch.Tensor:
+        compute_interactions: bool = True,
+        interaction_target_class: int | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return attribution routing scores and optional signed interactions.
+
+        Every masked coalition is evaluated once and cached. Coalition scores
+        either explain the class predicted by the complete encoder set or use
+        a fixed class-1 margin, according to ``self.attribution_target``.
+        Pairwise interactions never modify the routing score or encoder
+        weights; the fixed class-1 version may modulate the separate joint
+        representation branch.
+        """
         classifier_was_training = self.classifier.training
         router_was_training = self.router.training
         self.classifier.eval()
@@ -613,24 +696,170 @@ class GMEModel(nn.Module):
         try:
             with torch.no_grad():
                 full_logits, _ = self.forward_mean_fusion(projected)
-                predicted_class = int(full_logits.argmax(dim=1)[0].item())
-                full_score = class_logit_margin(full_logits, predicted_class)[0]
-                scores = []
-                for name in self.encoder_names:
-                    replaced = replace_encoder_embedding(
-                        projected,
-                        encoder_name=name,
-                        replacement_strategy=replacement_strategy,  # type: ignore[arg-type]
-                        baselines=baselines,
-                        gaussian_std_scale=gaussian_std_scale,
-                    )
+                attribution_target_class = (
+                    1
+                    if self.attribution_target == "class_1"
+                    else int(full_logits.argmax(dim=1)[0].item())
+                )
+                coalition_cache: Dict[frozenset[str], torch.Tensor] = {
+                    frozenset(): full_logits
+                }
+
+                def coalition_logits(masked_names: frozenset[str]) -> torch.Tensor:
+                    cached = coalition_cache.get(masked_names)
+                    if cached is not None:
+                        return cached
+                    replaced = dict(projected)
+                    for name in sorted(masked_names):
+                        replaced = replace_encoder_embedding(
+                            replaced,
+                            encoder_name=name,
+                            replacement_strategy=replacement_strategy,  # type: ignore[arg-type]
+                            baselines=baselines,
+                            gaussian_std_scale=gaussian_std_scale,
+                        )
                     masked_logits, _ = self.forward_mean_fusion(replaced)
-                    masked_score = class_logit_margin(masked_logits, predicted_class)[0]
-                    scores.append(full_score - masked_score)
+                    coalition_cache[masked_names] = masked_logits
+                    return masked_logits
+
+                def coalition_score(masked_names: frozenset[str], class_index: int) -> torch.Tensor:
+                    return class_logit_margin(coalition_logits(masked_names), class_index)[0]
+
+                full_score = coalition_score(frozenset(), attribution_target_class)
+                single_scores = {
+                    name: coalition_score(frozenset({name}), attribution_target_class)
+                    for name in self.encoder_names
+                }
+                single_contributions = torch.stack(
+                    [full_score - single_scores[name] for name in self.encoder_names]
+                )
+                interactions = full_score.new_zeros((len(self.encoder_names), len(self.encoder_names)))
+                if compute_interactions:
+                    pair_target_class = (
+                        attribution_target_class
+                        if interaction_target_class is None
+                        else int(interaction_target_class)
+                    )
+                    pair_full_score = coalition_score(frozenset(), pair_target_class)
+                    pair_single_scores = {
+                        name: coalition_score(frozenset({name}), pair_target_class)
+                        for name in self.encoder_names
+                    }
+                    for i, left in enumerate(self.encoder_names):
+                        for j in range(i + 1, len(self.encoder_names)):
+                            right = self.encoder_names[j]
+                            double_score = coalition_score(
+                                frozenset({left, right}), pair_target_class
+                            )
+                            value = (
+                                pair_full_score
+                                - pair_single_scores[left]
+                                - pair_single_scores[right]
+                                + double_score
+                            )
+                            interactions[i, j] = value
+                            interactions[j, i] = value
         finally:
             self.classifier.train(classifier_was_training)
             self.router.train(router_was_training)
-        return torch.stack(scores, dim=0)
+        return single_contributions, single_contributions, interactions
+
+    def flatten_interactions(self, interactions: torch.Tensor) -> torch.Tensor:
+        """Flatten the signed upper triangle in deterministic encoder order."""
+        return torch.stack([interactions[i, j] for i, j in self.interaction_pairs], dim=-1)
+
+    def set_interaction_stats(
+        self,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        rms: torch.Tensor,
+        count: int,
+    ) -> None:
+        expected = len(self.interaction_pairs)
+        if mean.numel() != expected or std.numel() != expected or rms.numel() != expected:
+            raise ValueError("Interaction statistics do not match the number of encoder pairs.")
+        self.interaction_mean.copy_(mean.to(self.interaction_mean).reshape_as(self.interaction_mean))
+        self.interaction_std.copy_(std.to(self.interaction_std).reshape_as(self.interaction_std).clamp_min(1e-8))
+        self.interaction_rms.copy_(rms.to(self.interaction_rms).reshape_as(self.interaction_rms).clamp_min(1e-8))
+        self.interaction_stats_count.copy_(
+            torch.as_tensor(int(count), device=self.interaction_stats_count.device)
+        )
+
+    def scale_interaction_vector(self, vector: torch.Tensor) -> torch.Tensor:
+        """Scale without centering so the original interaction sign is preserved."""
+        scaled = vector / self.interaction_rms.to(vector).clamp_min(1e-8)
+        return scaled.clamp(
+            min=-self.interaction_rms_clip,
+            max=self.interaction_rms_clip,
+        )
+
+    def interaction_pair_residual_from_vector(
+        self,
+        projected: Mapping[str, torch.Tensor],
+        routing_weights: torch.Tensor,
+        interaction_vector: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build a signed, attribution-gated joint representation residual.
+
+        All encoder tensors must be patch aligned. Pairwise Hadamard products
+        stay in the common projection space; a zero-initialized per-dimension
+        gate selects stable joint features. Division by Z_q prevents growth
+        with the number of encoder pairs.
+        """
+        tensors = [projected[name] for name in self.encoder_names]
+        first_shape = tensors[0].shape
+        for name, tensor in zip(self.encoder_names, tensors):
+            if tensor.shape != first_shape:
+                raise ValueError(
+                    "Pairwise interaction fusion requires aligned projected tensors; "
+                    f"expected {tuple(first_shape)}, got {tuple(tensor.shape)} for {name}."
+                )
+        weights = routing_weights.reshape(-1)
+        if weights.numel() != len(self.encoder_names):
+            raise ValueError(
+                f"Expected {len(self.encoder_names)} routing weights, got {weights.numel()}."
+            )
+        vector = interaction_vector.reshape(-1)
+        if vector.numel() != len(self.interaction_pairs):
+            raise ValueError(
+                f"Expected {len(self.interaction_pairs)} interactions, got {vector.numel()}."
+            )
+
+        scaled = self.scale_interaction_vector(vector)
+        normalized = {
+            name: F.layer_norm(projected[name], (self.target_dim,))
+            for name in self.encoder_names
+        }
+        numerator = torch.zeros_like(tensors[0])
+        z_q = weights.new_zeros(())
+        for pair_index, (i, j) in enumerate(self.interaction_pairs):
+            pair_gate = torch.sqrt((weights[i] * weights[j]).clamp_min(0.0))
+            pair_feature = (
+                normalized[self.encoder_names[i]]
+                * normalized[self.encoder_names[j]]
+            )
+            numerator = numerator + pair_gate * scaled[pair_index] * pair_feature
+            z_q = z_q + pair_gate
+        pair_representation = numerator / z_q.clamp_min(eps)
+        pair_residual = (
+            self.interaction_pair_beta
+            * torch.tanh(self.interaction_gate)
+            * torch.tanh(pair_representation)
+        )
+        return pair_residual, scaled
+
+    def interaction_pair_residual(
+        self,
+        projected: Mapping[str, torch.Tensor],
+        routing_weights: torch.Tensor,
+        interactions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.interaction_pair_residual_from_vector(
+            projected,
+            routing_weights,
+            self.flatten_interactions(interactions),
+        )
 
     def forward_stage2(
         self,
@@ -638,17 +867,50 @@ class GMEModel(nn.Module):
         baselines: Mapping[str, Mapping[str, torch.Tensor]],
         replacement_strategy: str = "mean",
         gaussian_std_scale: float = 1.0,
+        compute_interactions: bool = True,
+        return_attribution_logits: bool = False,
     ):
         projected = self.project(raw_features)
-        attr = self.intervention_attribution(
+        attr, single_attr, interactions = self.intervention_attribution(
             projected=projected,
             baselines=baselines,
             replacement_strategy=replacement_strategy,
             gaussian_std_scale=gaussian_std_scale,
+            compute_interactions=compute_interactions and self.interaction_pair_beta > 0.0,
+            interaction_target_class=1,
         )
         routed = self.route_with_scores(projected, attribution_scores=attr)
-        logits, attn = self.classifier(routed.fused)
-        return logits, attn, routed, projected, attr
+        if compute_interactions and self.interaction_pair_beta > 0.0:
+            pair_residual, scaled_interactions = self.interaction_pair_residual(
+                projected,
+                routed.weights,
+                interactions,
+            )
+            final_fused = routed.fused + pair_residual
+        else:
+            pair_residual = torch.zeros_like(routed.fused)
+            scaled_interactions = routed.fused.new_zeros(len(self.interaction_pairs))
+            final_fused = routed.fused
+            interactions = routed.fused.new_zeros(
+                (len(self.encoder_names), len(self.encoder_names))
+            )
+        logits, attn = self.classifier(final_fused)
+        if return_attribution_logits and self.interaction_pair_beta > 0.0:
+            attribution_logits, _ = self.classifier(routed.fused)
+        else:
+            attribution_logits = logits.detach()
+        return (
+            logits,
+            attn,
+            routed,
+            projected,
+            attr,
+            single_attr,
+            interactions,
+            attribution_logits,
+            pair_residual,
+            scaled_interactions,
+        )
 
 
 def move_features(features: Mapping[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -656,7 +918,7 @@ def move_features(features: Mapping[str, torch.Tensor], device: torch.device) ->
 
 
 class GMEProfileWrapper(nn.Module):
-    """Traceable online Student inference with attribution supplied offline."""
+    """Traceable online inference with attribution/interaction supplied offline."""
 
     def __init__(
         self,
@@ -668,14 +930,20 @@ class GMEProfileWrapper(nn.Module):
         self.encoder_names = list(encoder_names)
 
     def forward(self, *feature_tensors: torch.Tensor) -> torch.Tensor:
-        attribution_scores = feature_tensors[-1]
+        attribution_scores = feature_tensors[-2]
+        interaction_vector = feature_tensors[-1]
         raw_features = {
             name: tensor
-            for name, tensor in zip(self.encoder_names, feature_tensors[:-1])
+            for name, tensor in zip(self.encoder_names, feature_tensors[:-2])
         }
         projected = self.model.project(raw_features)
         routed = self.model.route_with_scores(projected, attribution_scores)
-        logits, _ = self.model.classifier(routed.fused)
+        pair_residual, _ = self.model.interaction_pair_residual_from_vector(
+            projected,
+            routed.weights,
+            interaction_vector,
+        )
+        logits, _ = self.model.classifier(routed.fused + pair_residual)
         return logits
 
 
@@ -705,16 +973,22 @@ def profile_sample_tuples(
     samples: Sequence[Mapping[str, torch.Tensor]],
     encoder_names: Sequence[str],
     attribution_scores: Sequence[torch.Tensor] | None = None,
+    interaction_vectors: Sequence[torch.Tensor] | None = None,
 ) -> List[Tuple[torch.Tensor, ...]]:
     feature_tuples = [
         tuple(raw_features[name] for name in encoder_names)
         for raw_features in samples
     ]
-    if attribution_scores is None:
+    if attribution_scores is None and interaction_vectors is None:
         return feature_tuples
-    if len(feature_tuples) != len(attribution_scores):
-        raise ValueError("Profile samples and attribution scores must have the same length.")
-    return [features + (scores,) for features, scores in zip(feature_tuples, attribution_scores)]
+    if attribution_scores is None or interaction_vectors is None:
+        raise ValueError("Attribution scores and interaction vectors must be supplied together.")
+    if len(feature_tuples) != len(attribution_scores) or len(feature_tuples) != len(interaction_vectors):
+        raise ValueError("Profile samples and offline routing inputs must have the same length.")
+    return [
+        features + (scores, interaction)
+        for features, scores, interaction in zip(feature_tuples, attribution_scores, interaction_vectors)
+    ]
 
 
 def estimate_fvcore_flops(wrapper: nn.Module, samples: Sequence[Tuple[torch.Tensor, ...]]) -> float:
@@ -800,18 +1074,30 @@ def profile_gme_efficiency(
     model.eval()
     with torch.no_grad():
         offline_scores = []
+        offline_interactions = []
         for raw_features in raw_samples:
             projected = model.project(raw_features)
-            offline_scores.append(
-                model.intervention_attribution(
-                    projected=projected,
-                    baselines=baselines,
-                    replacement_strategy=replacement_strategy,
-                    gaussian_std_scale=gaussian_std_scale,
-                ).detach()
+            routing_scores, _, _ = model.intervention_attribution(
+                projected=projected,
+                baselines=baselines,
+                replacement_strategy=replacement_strategy,
+                gaussian_std_scale=gaussian_std_scale,
+                compute_interactions=False,
             )
+            _, _, interactions = model.intervention_attribution(
+                projected=projected,
+                baselines=baselines,
+                replacement_strategy=replacement_strategy,
+                gaussian_std_scale=gaussian_std_scale,
+                compute_interactions=True,
+                interaction_target_class=1,
+            )
+            offline_scores.append(routing_scores.detach())
+            offline_interactions.append(model.flatten_interactions(interactions).detach())
     model.train(was_training)
-    profile_inputs = profile_sample_tuples(raw_samples, model.encoder_names, offline_scores)
+    profile_inputs = profile_sample_tuples(
+        raw_samples, model.encoder_names, offline_scores, offline_interactions
+    )
     wrapper = GMEProfileWrapper(model, model.encoder_names).to(device)
     flops = estimate_fvcore_flops(wrapper, profile_inputs)
     inference_time = measure_forward_time_seconds(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
@@ -826,6 +1112,28 @@ def set_projection_trainable(model: GMEModel, trainable: bool) -> None:
     for param in model.projection_heads.parameters():
         param.requires_grad_(trainable)
     model.projection_heads.train(trainable)
+
+
+def build_stage2_optimizer(model: GMEModel, args: argparse.Namespace) -> torch.optim.AdamW:
+    pair_parameters = [model.interaction_gate] if model.interaction_gate.requires_grad else []
+    pair_parameter_ids = {id(parameter) for parameter in pair_parameters}
+    backbone_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in pair_parameter_ids
+    ]
+    parameter_groups = []
+    if backbone_parameters:
+        parameter_groups.append({"params": backbone_parameters, "weight_decay": args.weight_decay})
+    if pair_parameters:
+        parameter_groups.append({
+            "params": pair_parameters,
+            "lr": args.interaction_pair_lr,
+            "weight_decay": args.interaction_pair_weight_decay,
+        })
+    if not parameter_groups:
+        raise RuntimeError("No trainable parameters left for Stage2.")
+    return torch.optim.AdamW(parameter_groups, lr=args.lr_stage2)
 
 
 def reset_stage2_classifier(model: GMEModel, args: argparse.Namespace, device: torch.device) -> None:
@@ -1034,40 +1342,67 @@ def evaluate_stage1_geometry(
 
 
 @torch.no_grad()
-def update_train_routing_score_stats(
+def update_train_offline_stats(
     model: GMEModel,
     dataset: MultiEncoderSlideDataset,
     device: torch.device,
     baselines: Mapping[str, Mapping[str, torch.Tensor]],
     replacement_strategy: str,
     gaussian_std_scale: float,
-) -> Dict[str, float]:
-    """Estimate scalar attribution normalization stats from the whole train split."""
+) -> Tuple[Dict[str, float], Dict[str, object]]:
+    """Estimate routing and per-pair interaction statistics from train only."""
     was_training = model.training
     model.eval()
 
-    attr_scores = []
+    single_values = []
+    interaction_values = []
     for idx in range(len(dataset)):
         raw_features, _, _ = dataset[idx]
         raw_features = move_features(raw_features, device)
         projected = model.project(raw_features)
-        attr_scores.append(
-            model.intervention_attribution(
+        compute_interactions = model.interaction_pair_beta > 0.0
+        routing_scores, _single, interactions = model.intervention_attribution(
                 projected=projected,
                 baselines=baselines,
                 replacement_strategy=replacement_strategy,
                 gaussian_std_scale=gaussian_std_scale,
+                compute_interactions=compute_interactions,
+                interaction_target_class=1,
             )
-        )
+        single_values.append(routing_scores)
+        if compute_interactions:
+            interaction_values.append(model.flatten_interactions(interactions))
 
-    attr_min, attr_max, attr_count = _min_max_from_score_list(attr_scores)
+    score_min, score_max, score_count = _min_max_from_score_list(single_values)
     model.router.set_score_stats(
-        attribution_min=attr_min,
-        attribution_max=attr_max,
-        count=attr_count,
+        attribution_min=score_min,
+        attribution_max=score_max,
+        count=score_count,
     )
+    if interaction_values:
+        interaction_tensor = torch.stack(interaction_values, dim=0).float()
+        interaction_mean = interaction_tensor.mean(dim=0)
+        interaction_std = interaction_tensor.std(dim=0, unbiased=False).clamp_min(1e-8)
+        interaction_rms = interaction_tensor.square().mean(dim=0).sqrt().clamp_min(1e-8)
+        model.set_interaction_stats(
+            mean=interaction_mean,
+            std=interaction_std,
+            rms=interaction_rms,
+            count=interaction_tensor.shape[0],
+        )
+    interaction_stats: Dict[str, object] = {
+        "count": int(model.interaction_stats_count.detach().cpu().item()),
+        "pair_names": [
+            f"{model.encoder_names[i]}__{model.encoder_names[j]}"
+            for i, j in model.interaction_pairs
+        ],
+        "mean": model.interaction_mean.detach().cpu().tolist(),
+        "std": model.interaction_std.detach().cpu().tolist(),
+        "rms": model.interaction_rms.detach().cpu().tolist(),
+        "scaling": "signed_rms_without_centering",
+    }
     model.train(was_training)
-    return model.router.get_score_stats()
+    return model.router.get_score_stats(), interaction_stats
 
 
 def train_stage2_epoch(
@@ -1098,11 +1433,23 @@ def train_stage2_epoch(
         label_t = torch.tensor([label], dtype=torch.long, device=device)
 
         optimizer.zero_grad(set_to_none=True)
-        logits, _attn, _routed, projected, _attr = model.forward_stage2(
+        (
+            logits,
+            _attn,
+            _routed,
+            projected,
+            _attr,
+            _single_attr,
+            _interactions,
+            _base_logits,
+            _pair_residual,
+            _scaled_interactions,
+        ) = model.forward_stage2(
             raw_features=raw_features,
             baselines=baselines,
             replacement_strategy=replacement_strategy,
             gaussian_std_scale=gaussian_std_scale,
+            compute_interactions=True,
         )
         cls_loss = criterion(logits, label_t)
         if beacon_constraint_weight > 0:
@@ -1133,39 +1480,70 @@ def evaluate_stage2(
     gaussian_std_scale: float,
     decision_threshold: float,
     fused_output_dir: Path | None = None,
-) -> Tuple[EvalResult, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[EvalResult, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     model.eval()
-    labels, probs, rows, weight_rows = [], [], [], []
+    labels, probs, rows, weight_rows, interaction_rows = [], [], [], [], []
     if fused_output_dir is not None:
         fused_output_dir.mkdir(parents=True, exist_ok=True)
 
     for idx in range(len(dataset)):
         raw_features, label, slide_id = dataset[idx]
         raw_features = move_features(raw_features, device)
-        logits, _attn, routed, projected, attr = model.forward_stage2(
+        (
+            logits,
+            _attn,
+            routed,
+            projected,
+            attr,
+            single_attr,
+            interactions,
+            base_logits,
+            pair_residual,
+            scaled_interactions,
+        ) = model.forward_stage2(
             raw_features=raw_features,
             baselines=baselines,
             replacement_strategy=replacement_strategy,
             gaussian_std_scale=gaussian_std_scale,
+            return_attribution_logits=True,
         )
         beacon_sims: Dict[str, torch.Tensor] = {}
         if beacon is not None:
             _, beacon_sims = model.beacon_constraint_loss(projected=projected, beacon=beacon)
         prob = float(torch.softmax(logits, dim=1)[0, 1].detach().cpu())
+        base_prob = float(torch.softmax(base_logits, dim=1)[0, 1].detach().cpu())
+        pair_rms = float(pair_residual.detach().float().square().mean().sqrt().cpu())
+        attribution_rms = float(routed.fused.detach().float().square().mean().sqrt().cpu())
+        pair_relative_rms = pair_rms / max(attribution_rms, 1e-8)
         labels.append(int(label))
         probs.append(prob)
-        rows.append({"slide_id": slide_id, "label": int(label), "prob_class1": prob})
+        rows.append({
+            "slide_id": slide_id,
+            "label": int(label),
+            "prob_class1": prob,
+            "base_prob_class1": base_prob,
+            "prob_delta": prob - base_prob,
+            "pair_residual_rms": pair_rms,
+            "attribution_fused_rms": attribution_rms,
+            "pair_relative_rms": pair_relative_rms,
+        })
 
         weights = routed.weights.detach().cpu().reshape(-1).numpy()
         attr_np = attr.detach().cpu().reshape(-1).numpy()
+        single_np = single_attr.detach().cpu().reshape(-1).numpy()
+        interaction_np = interactions.detach().cpu().numpy()
+        scaled_interaction_np = scaled_interactions.detach().cpu().reshape(-1).numpy()
         c_range = float(routed.attribution_range.detach().cpu().reshape(-1).item())
         tau = float(routed.tau.detach().cpu().reshape(-1).item())
-        for encoder, weight, attr_value in zip(routed.encoder_names, weights, attr_np):
+        for encoder, weight, attr_value, single_value in zip(
+            routed.encoder_names, weights, attr_np, single_np
+        ):
             weight_rows.append({
                 "slide_id": slide_id,
                 "encoder": encoder,
                 "weight": float(weight),
-                "attribution": float(attr_value),
+                "attribution": float(single_value),
+                "routing_score": float(attr_value),
                 "c_range": c_range,
                 "tau": tau,
                 "beacon_similarity": (
@@ -1174,9 +1552,19 @@ def evaluate_stage2(
                     else np.nan
                 ),
             })
+        for pair_index, (i, j) in enumerate(model.interaction_pairs):
+            left = routed.encoder_names[i]
+            right = routed.encoder_names[j]
+            interaction_rows.append({
+                "slide_id": slide_id,
+                "encoder_i": left,
+                "encoder_j": right,
+                "interaction": float(interaction_np[i, j]),
+                "scaled_interaction": float(scaled_interaction_np[pair_index]),
+            })
 
         if fused_output_dir is not None:
-            fused = routed.fused.detach().cpu().numpy().astype(np.float32)
+            fused = (routed.fused + pair_residual).detach().cpu().numpy().astype(np.float32)
             with h5py.File(fused_output_dir / f"{slide_id}.h5", "w") as f:
                 f.create_dataset("features", data=fused, compression="gzip")
 
@@ -1184,7 +1572,7 @@ def evaluate_stage2(
     pred_df = pd.DataFrame(rows)
     pred_df["threshold"] = metrics.threshold
     pred_df["pred"] = (pred_df["prob_class1"] >= metrics.threshold).astype(int)
-    return metrics, pred_df, pd.DataFrame(weight_rows)
+    return metrics, pred_df, pd.DataFrame(weight_rows), pd.DataFrame(interaction_rows)
 
 
 def save_fold_outputs(
@@ -1193,10 +1581,26 @@ def save_fold_outputs(
     metrics: EvalResult,
     predictions: pd.DataFrame,
     weights: pd.DataFrame | None = None,
+    interactions: pd.DataFrame | None = None,
     efficiency: Mapping[str, float] | None = None,
 ) -> None:
     fold_dir.mkdir(parents=True, exist_ok=True)
     metric_row = {**{"stage": stage_name}, **asdict(metrics)}
+    if {"label", "base_prob_class1"}.issubset(predictions.columns):
+        attribution_metrics = compute_metrics(
+            predictions["label"],
+            predictions["base_prob_class1"],
+            decision_threshold=metrics.threshold,
+        )
+        metric_row.update({
+            "attribution_only_auc": attribution_metrics.auc,
+            "attribution_only_auprc": attribution_metrics.auprc,
+            "attribution_only_accuracy": attribution_metrics.accuracy,
+            "attribution_only_f1": attribution_metrics.f1,
+            "pair_delta_auc": metrics.auc - attribution_metrics.auc,
+            "pair_delta_auprc": metrics.auprc - attribution_metrics.auprc,
+            "pair_delta_f1": metrics.f1 - attribution_metrics.f1,
+        })
     if efficiency:
         metric_row.update(dict(efficiency))
     pd.DataFrame([metric_row]).to_csv(
@@ -1211,6 +1615,26 @@ def save_fold_outputs(
         encoding="utf-8-sig",
         float_format="%.6f",
     )
+    pair_stats = {}
+    for column in ("prob_delta", "pair_residual_rms", "pair_relative_rms"):
+        if column not in predictions.columns:
+            continue
+        values = pd.to_numeric(predictions[column], errors="coerce").dropna()
+        if values.empty:
+            continue
+        pair_stats[column] = {
+            "mean": float(values.mean()),
+            "std": float(values.std(ddof=0)),
+            "min": float(values.min()),
+            "p25": float(values.quantile(0.25)),
+            "median": float(values.median()),
+            "p75": float(values.quantile(0.75)),
+            "max": float(values.max()),
+            "mean_abs": float(values.abs().mean()),
+        }
+    if pair_stats:
+        with open(fold_dir / f"{stage_name}_pair_branch_stats.json", "w", encoding="utf-8") as f:
+            json.dump(pair_stats, f, indent=2)
     cm = pd.DataFrame(
         [[metrics.tn, metrics.fp], [metrics.fn, metrics.tp]],
         index=["true_0", "true_1"],
@@ -1224,6 +1648,32 @@ def save_fold_outputs(
             encoding="utf-8-sig",
             float_format="%.6f",
         )
+    if interactions is not None and not interactions.empty:
+        interactions.to_csv(
+            fold_dir / f"{stage_name}_pairwise_interactions.csv",
+            index=False,
+            encoding="utf-8-sig",
+            float_format="%.6f",
+        )
+        encoder_names = sorted(set(interactions["encoder_i"]) | set(interactions["encoder_j"]))
+        mean_pairs = interactions.groupby(["encoder_i", "encoder_j"])["interaction"].mean()
+        matrix = pd.DataFrame(np.nan, index=encoder_names, columns=encoder_names)
+        for encoder in encoder_names:
+            matrix.loc[encoder, encoder] = 0.0
+        for (left, right), value in mean_pairs.items():
+            matrix.loc[left, right] = float(value)
+        matrix.index.name = "encoder"
+        matrix.to_csv(
+            fold_dir / f"{stage_name}_interaction_matrix.csv",
+            encoding="utf-8-sig",
+            float_format="%.6f",
+        )
+        if stage_name == "final":
+            matrix.to_csv(
+                fold_dir / "interaction_matrix.csv",
+                encoding="utf-8-sig",
+                float_format="%.6f",
+            )
 
 
 def summarize_metrics(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
@@ -1329,6 +1779,9 @@ def run_fold(
         droprate=args.droprate,
         routing_temperature=args.routing_temperature,
         routing_logit_scale=args.routing_logit_scale,
+        attribution_target=args.attribution_target,
+        interaction_pair_beta=args.interaction_pair_beta,
+        interaction_rms_clip=args.interaction_rms_clip,
     ).to(device)
 
     print(f"\nFold {fold}: train={len(train_ds)}, val={len(val_ds)}, encoders={train_ds.encoder_names}")
@@ -1498,21 +1951,14 @@ def run_fold(
         name: value.detach().clone() for name, value in model.state_dict().items()
     }
 
-    trainable_params = [param for param in model.parameters() if param.requires_grad]
-    if not trainable_params:
-        raise RuntimeError("No trainable parameters left for Stage2.")
-
-    optimizer2 = torch.optim.AdamW(
-        trainable_params,
-        lr=args.lr_stage2,
-        weight_decay=args.weight_decay,
-    )
+    optimizer2 = build_stage2_optimizer(model, args)
     scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=max(args.stage2_epochs, 1), eta_min=args.lr_stage2 * 0.01)
     best_stage2_auc = -math.inf
     best_stage2_path = fold_dir / "best_gme_model.pt"
     best_beacon_path = fold_dir / "static_beacon_and_baselines.pt"
     best_stage2_metrics: EvalResult | None = None
     no_improve = 0
+    stage2_history: List[Dict[str, float | int]] = []
 
     static_beacon = static_beacon_summary = static_baselines = static_baseline_summary = None
     if args.freeze_projection_stage2:
@@ -1536,7 +1982,7 @@ def run_fold(
                 device,
                 args.target_dim,
             )
-        score_stats = update_train_routing_score_stats(
+        score_stats, interaction_stats = update_train_offline_stats(
             model=model,
             dataset=inner_score_stats_ds,
             device=device,
@@ -1563,7 +2009,7 @@ def run_fold(
                 device,
                 args.target_dim,
             )
-        score_stats = update_train_routing_score_stats(
+        score_stats, interaction_stats = update_train_offline_stats(
             model=model,
             dataset=inner_score_stats_ds,
             device=device,
@@ -1571,7 +2017,7 @@ def run_fold(
             replacement_strategy=args.replacement_strategy,
             gaussian_std_scale=args.gaussian_std_scale,
         )
-        val_metrics, val_pred, val_weights = evaluate_stage2(
+        val_metrics, val_pred, val_weights, val_interactions = evaluate_stage2(
             model=model,
             dataset=inner_val_ds,
             device=device,
@@ -1583,11 +2029,41 @@ def run_fold(
         )
         scheduler2.step()
         stats = model.router.get_routing_stats()
+        base_val_metrics = compute_metrics(
+            val_pred["label"],
+            val_pred["base_prob_class1"],
+            decision_threshold=args.threshold,
+        )
+        mean_pair_relative_rms = float(val_pred["pair_relative_rms"].mean())
+        mean_abs_prob_delta = float(val_pred["prob_delta"].abs().mean())
+        stage2_history.append({
+            "epoch": int(epoch),
+            "train_loss": float(train_loss),
+            "train_cls_loss": float(train_cls_loss),
+            "train_beacon_loss": float(train_beacon_loss),
+            "inner_auc": float(val_metrics.auc),
+            "inner_auprc": float(val_metrics.auprc),
+            "inner_f1": float(val_metrics.f1),
+            "attribution_only_auc": float(base_val_metrics.auc),
+            "attribution_only_auprc": float(base_val_metrics.auprc),
+            "attribution_only_f1": float(base_val_metrics.f1),
+            "mean_pair_relative_rms": mean_pair_relative_rms,
+            "mean_abs_prob_delta": mean_abs_prob_delta,
+            "max_abs_prob_delta": float(val_pred["prob_delta"].abs().max()),
+        })
+        pd.DataFrame(stage2_history).to_csv(
+            fold_dir / "stage2_training_history.csv",
+            index=False,
+            encoding="utf-8-sig",
+            float_format="%.6f",
+        )
         print(
             f"Fold {fold} | Stage2 | Epoch {epoch:03d}/{args.stage2_epochs} | "
             f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | beacon={train_beacon_loss:.4f} | "
             f"inner_AUC={val_metrics.auc:.4f} | inner_AUPRC={val_metrics.auprc:.4f} | "
+            f"attr_AUC={base_val_metrics.auc:.4f} | "
             f"ACC@{args.threshold:g}={val_metrics.accuracy:.4f} | F1@{args.threshold:g}={val_metrics.f1:.4f} | "
+            f"pair_rel_RMS={mean_pair_relative_rms:.4f} | |delta_p|={mean_abs_prob_delta:.6f} | "
             f"I_min={score_stats['attribution_min']:.4f} | I_max={score_stats['attribution_max']:.4f}"
         )
 
@@ -1611,6 +2087,9 @@ def run_fold(
                     "freeze_projection_stage2": bool(args.freeze_projection_stage2),
                     "stage1_path": str(stage1_path) if stage1_path.exists() else None,
                     "routing_score_stats": score_stats,
+                    "interaction_stats": interaction_stats,
+                    "interaction_pair_beta": float(args.interaction_pair_beta),
+                    "interaction_scaling": "signed_train_only_rms_without_centering",
                     "baseline_policy": (
                         "Train-only replacement baselines built once from frozen Stage1 projection."
                         if args.freeze_projection_stage2
@@ -1657,7 +2136,10 @@ def run_fold(
             )
             baseline_summary.to_csv(fold_dir / "replacement_baseline_summary.csv", index=False, encoding="utf-8-sig")
             beacon_summary.to_csv(fold_dir / "static_beacon_summary.csv", index=False, encoding="utf-8-sig")
-            save_fold_outputs(fold_dir, "inner_selection", val_metrics, val_pred, val_weights)
+            save_fold_outputs(
+                fold_dir, "inner_selection", val_metrics, val_pred, val_weights,
+                interactions=val_interactions,
+            )
         else:
             no_improve += 1
             if no_improve >= args.patience:
@@ -1671,11 +2153,7 @@ def run_fold(
     selected_epoch = int(selected_payload.get("epoch", 1))
     model.load_state_dict(initial_stage2_state)
     seed_everything(args.seed + fold)
-    retrain_optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=args.lr_stage2,
-        weight_decay=args.weight_decay,
-    )
+    retrain_optimizer = build_stage2_optimizer(model, args)
     retrain_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         retrain_optimizer,
         T_max=max(selected_epoch, 1),
@@ -1691,7 +2169,7 @@ def run_fold(
             )
         else:
             beacon, _, baselines, _ = static_outer
-        update_train_routing_score_stats(
+        update_train_offline_stats(
             model=model,
             dataset=score_stats_ds,
             device=device,
@@ -1716,7 +2194,7 @@ def run_fold(
     beacon, _, baselines, _ = build_beacon_and_baselines(
         model, baseline_ds, device, args.target_dim
     )
-    update_train_routing_score_stats(
+    _, final_interaction_stats = update_train_offline_stats(
         model=model,
         dataset=score_stats_ds,
         device=device,
@@ -1738,7 +2216,7 @@ def run_fold(
             indent=2,
         )
     fused_dir = fold_dir / "fused_val_h5" if args.save_fused_h5 else None
-    final_metrics, final_pred, final_weights = evaluate_stage2(
+    final_metrics, final_pred, final_weights, final_interactions = evaluate_stage2(
         model=model,
         dataset=val_ds,
         device=device,
@@ -1760,7 +2238,10 @@ def run_fold(
         profile_warmup=args.profile_warmup,
         profile_repeat=args.profile_repeat,
     )
-    save_fold_outputs(fold_dir, "final", final_metrics, final_pred, final_weights, efficiency=efficiency)
+    save_fold_outputs(
+        fold_dir, "final", final_metrics, final_pred, final_weights,
+        interactions=final_interactions, efficiency=efficiency,
+    )
     save_checkpoint(
         best_stage2_path,
         model,
@@ -1771,11 +2252,36 @@ def run_fold(
             "stage": "stage2_retrained_outer_train",
             "selection_policy": "inner_validation_AUC_then_retrain_on_outer_train",
             "selected_inner_epoch": selected_epoch,
+            "interaction_stats": final_interaction_stats,
+            "interaction_pair_beta": float(args.interaction_pair_beta),
+            "interaction_scaling": "signed_train_only_rms_without_centering",
         },
     )
 
     with open(fold_dir / "routing_stats.json", "w", encoding="utf-8") as f:
         json.dump(model.router.get_routing_stats(), f, indent=2)
+    with open(fold_dir / "interaction_pair_branch.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                **final_interaction_stats,
+                "beta": float(args.interaction_pair_beta),
+                "rms_clip": float(args.interaction_rms_clip),
+                "normalization": "divide_by_train_only_pair_rms_without_centering",
+                "all_pairs_used": True,
+                "branch": "parameter_free_hadamard_pairs_with_feature_gate",
+                "gate_zero_initialized": True,
+                "gate_parameter_count": int(model.interaction_gate.numel()),
+                "gate_l2": float(model.interaction_gate.detach().float().norm().cpu()),
+                "gate_tanh_abs_mean": float(
+                    torch.tanh(model.interaction_gate.detach()).abs().mean().cpu()
+                ),
+                "gate_tanh_abs_max": float(
+                    torch.tanh(model.interaction_gate.detach()).abs().max().cpu()
+                ),
+            },
+            f,
+            indent=2,
+        )
 
     row = {
         "fold": int(fold),

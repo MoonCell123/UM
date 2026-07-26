@@ -48,6 +48,11 @@ threshold: 0.5
 
 replacement_strategy: "mean"
 gaussian_std_scale: 1.0
+attribution_target: "predicted_class"
+interaction_pair_beta: 0.0
+interaction_pair_lr: 0.001
+interaction_pair_weight_decay: 0.01
+interaction_rms_clip: 3.0
 beacon_constraint_weight: 0.05
 
 max_patches: 0
