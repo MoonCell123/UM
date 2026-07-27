@@ -24,6 +24,7 @@ import random
 import subprocess
 import sys
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -86,6 +87,67 @@ class EvalResult:
     fp: int
     fn: int
     tp: int
+
+
+class ExponentialMovingAverage:
+    """Maintain an optimizer-step EMA of model parameters.
+
+    Offline routing statistics are deliberately not averaged. They are rebuilt
+    from train-only data after applying the averaged parameters.
+    """
+
+    def __init__(self, decay: float) -> None:
+        if not 0.0 < float(decay) < 1.0:
+            raise ValueError(f"EMA decay must be between 0 and 1, got {decay}")
+        self.decay = float(decay)
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.num_updates = 0
+
+    @property
+    def initialized(self) -> bool:
+        return bool(self.shadow)
+
+    @torch.no_grad()
+    def initialize(self, model: nn.Module) -> None:
+        self.shadow = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+        }
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        if not self.initialized:
+            raise RuntimeError("EMA must be initialized before update().")
+        current_names = {name for name, _ in model.named_parameters()}
+        if current_names != set(self.shadow):
+            raise RuntimeError("Model parameters changed after EMA initialization.")
+        one_minus_decay = 1.0 - self.decay
+        for name, parameter in model.named_parameters():
+            self.shadow[name].mul_(self.decay).add_(parameter.detach(), alpha=one_minus_decay)
+        self.num_updates += 1
+
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module) -> None:
+        if not self.initialized:
+            raise RuntimeError("EMA has not been initialized.")
+        for name, parameter in model.named_parameters():
+            if name not in self.shadow:
+                raise RuntimeError(f"EMA is missing parameter: {name}")
+            parameter.copy_(self.shadow[name])
+
+    @contextmanager
+    def average_parameters(self, model: nn.Module):
+        """Temporarily apply EMA parameters and restore parameters/buffers after use."""
+        backup = {
+            name: value.detach().clone()
+            for name, value in model.state_dict().items()
+        }
+        self.copy_to(model)
+        try:
+            yield
+        finally:
+            model.load_state_dict(backup)
 
 
 def load_config_file(config_path: Path | None) -> Dict[str, object]:
@@ -200,6 +262,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument(
+        "--weight-averaging",
+        choices=["none", "ema"],
+        default="none",
+        help="Weight averaging used for inner selection and final outer-test evaluation.",
+    )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.99,
+        help="Optimizer-step EMA decay. Used only when --weight-averaging=ema.",
+    )
+    parser.add_argument(
+        "--ema-start-epoch",
+        type=int,
+        default=2,
+        help="First Stage2 epoch included in EMA. Earlier epochs use raw weights.",
+    )
+    parser.add_argument(
         "--threshold",
         type=float,
         default=0.5,
@@ -305,6 +385,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--interaction-pair-lr must be positive.")
     if float(args.interaction_rms_clip) <= 0.0:
         raise ValueError("--interaction-rms-clip must be positive.")
+    if not 0.0 < float(args.ema_decay) < 1.0:
+        raise ValueError("--ema-decay must be between 0 and 1.")
+    if int(args.ema_start_epoch) < 1:
+        raise ValueError("--ema-start-epoch must be at least 1.")
     for name in PATH_ARGS:
         value = getattr(args, name, None)
         if value is not None and not isinstance(value, Path):
@@ -1416,6 +1500,7 @@ def train_stage2_epoch(
     replacement_strategy: str,
     gaussian_std_scale: float,
     grad_clip: float,
+    weight_averager: ExponentialMovingAverage | None = None,
 ) -> Tuple[float, float, float]:
     projection_is_trainable = any(param.requires_grad for param in model.projection_heads.parameters())
     model.train()
@@ -1461,6 +1546,8 @@ def train_stage2_epoch(
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
+        if weight_averager is not None:
+            weight_averager.update(model)
         total_loss += float(loss.detach().cpu())
         total_cls_loss += float(cls_loss.detach().cpu())
         total_beacon_loss += float(beacon_loss.detach().cpu())
@@ -1958,7 +2045,20 @@ def run_fold(
     best_beacon_path = fold_dir / "static_beacon_and_baselines.pt"
     best_stage2_metrics: EvalResult | None = None
     no_improve = 0
-    stage2_history: List[Dict[str, float | int]] = []
+    stage2_history: List[Dict[str, object]] = []
+    ema = (
+        ExponentialMovingAverage(args.ema_decay)
+        if args.weight_averaging == "ema"
+        else None
+    )
+    print(
+        f"Stage2 evaluation weights: {args.weight_averaging}"
+        + (
+            f" | decay={args.ema_decay:g} | start_epoch={args.ema_start_epoch}"
+            if ema is not None
+            else ""
+        )
+    )
 
     # Initialize train-only offline statistics once. After every epoch they are
     # refreshed for the updated model, used for validation, and carried into
@@ -1979,6 +2079,8 @@ def run_fold(
     )
 
     for epoch in range(1, args.stage2_epochs + 1):
+        if ema is not None and not ema.initialized and epoch >= args.ema_start_epoch:
+            ema.initialize(model)
         train_loss, train_cls_loss, train_beacon_loss = train_stage2_epoch(
             model=model,
             dataset=inner_train_ds,
@@ -1990,6 +2092,7 @@ def run_fold(
             replacement_strategy=args.replacement_strategy,
             gaussian_std_scale=args.gaussian_std_scale,
             grad_clip=args.grad_clip,
+            weight_averager=ema if ema is not None and ema.initialized else None,
         )
         if not args.freeze_projection_stage2:
             beacon, beacon_summary, baselines, baseline_summary = build_beacon_and_baselines(
@@ -2006,134 +2109,169 @@ def run_fold(
             replacement_strategy=args.replacement_strategy,
             gaussian_std_scale=args.gaussian_std_scale,
         )
-        val_metrics, val_pred, val_weights, val_interactions = evaluate_stage2(
-            model=model,
-            dataset=inner_val_ds,
-            device=device,
-            baselines=baselines,
-            beacon=beacon,
-            replacement_strategy=args.replacement_strategy,
-            gaussian_std_scale=args.gaussian_std_scale,
-            decision_threshold=args.threshold,
-        )
         scheduler2.step()
-        stats = model.router.get_routing_stats()
-        base_val_metrics = compute_metrics(
-            val_pred["label"],
-            val_pred["base_prob_class1"],
-            decision_threshold=args.threshold,
-        )
-        mean_pair_relative_rms = float(val_pred["pair_relative_rms"].mean())
-        mean_abs_prob_delta = float(val_pred["prob_delta"].abs().mean())
-        stage2_history.append({
-            "epoch": int(epoch),
-            "train_loss": float(train_loss),
-            "train_cls_loss": float(train_cls_loss),
-            "train_beacon_loss": float(train_beacon_loss),
-            "inner_auc": float(val_metrics.auc),
-            "inner_auprc": float(val_metrics.auprc),
-            "inner_f1": float(val_metrics.f1),
-            "attribution_only_auc": float(base_val_metrics.auc),
-            "attribution_only_auprc": float(base_val_metrics.auprc),
-            "attribution_only_f1": float(base_val_metrics.f1),
-            "mean_pair_relative_rms": mean_pair_relative_rms,
-            "mean_abs_prob_delta": mean_abs_prob_delta,
-            "max_abs_prob_delta": float(val_pred["prob_delta"].abs().max()),
-        })
-        pd.DataFrame(stage2_history).to_csv(
-            fold_dir / "stage2_training_history.csv",
-            index=False,
-            encoding="utf-8-sig",
-            float_format="%.6f",
-        )
-        print(
-            f"Fold {fold} | Stage2 | Epoch {epoch:03d}/{args.stage2_epochs} | "
-            f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | beacon={train_beacon_loss:.4f} | "
-            f"inner_AUC={val_metrics.auc:.4f} | inner_AUPRC={val_metrics.auprc:.4f} | "
-            f"attr_AUC={base_val_metrics.auc:.4f} | "
-            f"ACC@{args.threshold:g}={val_metrics.accuracy:.4f} | F1@{args.threshold:g}={val_metrics.f1:.4f} | "
-            f"pair_rel_RMS={mean_pair_relative_rms:.4f} | |delta_p|={mean_abs_prob_delta:.6f} | "
-            f"I_min={score_stats['attribution_min']:.4f} | I_max={score_stats['attribution_max']:.4f}"
-        )
+        use_ema_for_eval = ema is not None and ema.initialized
+        evaluation_context = ema.average_parameters(model) if use_ema_for_eval else nullcontext()
+        with evaluation_context:
+            evaluation_weight_source = "ema" if use_ema_for_eval else "raw"
+            if use_ema_for_eval:
+                eval_beacon, eval_beacon_summary, eval_baselines, eval_baseline_summary = build_beacon_and_baselines(
+                    model,
+                    inner_baseline_ds,
+                    device,
+                    args.target_dim,
+                )
+                eval_score_stats, eval_interaction_stats = update_train_offline_stats(
+                    model=model,
+                    dataset=inner_score_stats_ds,
+                    device=device,
+                    baselines=eval_baselines,
+                    replacement_strategy=args.replacement_strategy,
+                    gaussian_std_scale=args.gaussian_std_scale,
+                )
+            else:
+                eval_beacon = beacon
+                eval_beacon_summary = beacon_summary
+                eval_baselines = baselines
+                eval_baseline_summary = baseline_summary
+                eval_score_stats = score_stats
+                eval_interaction_stats = interaction_stats
 
-        improved = not np.isnan(val_metrics.auc) and val_metrics.auc > best_stage2_auc
-        if improved:
-            best_stage2_auc = val_metrics.auc
-            best_stage2_metrics = val_metrics
-            no_improve = 0
-            save_checkpoint(
-                best_stage2_path,
-                model,
-                epoch,
-                val_metrics,
-                {
+            val_metrics, val_pred, val_weights, val_interactions = evaluate_stage2(
+                model=model,
+                dataset=inner_val_ds,
+                device=device,
+                baselines=eval_baselines,
+                beacon=eval_beacon,
+                replacement_strategy=args.replacement_strategy,
+                gaussian_std_scale=args.gaussian_std_scale,
+                decision_threshold=args.threshold,
+            )
+            base_val_metrics = compute_metrics(
+                val_pred["label"],
+                val_pred["base_prob_class1"],
+                decision_threshold=args.threshold,
+            )
+            mean_pair_relative_rms = float(val_pred["pair_relative_rms"].mean())
+            mean_abs_prob_delta = float(val_pred["prob_delta"].abs().mean())
+            stage2_history.append({
+                "epoch": int(epoch),
+                "evaluation_weight_source": evaluation_weight_source,
+                "ema_updates": int(ema.num_updates) if ema is not None else 0,
+                "train_loss": float(train_loss),
+                "train_cls_loss": float(train_cls_loss),
+                "train_beacon_loss": float(train_beacon_loss),
+                "inner_auc": float(val_metrics.auc),
+                "inner_auprc": float(val_metrics.auprc),
+                "inner_f1": float(val_metrics.f1),
+                "attribution_only_auc": float(base_val_metrics.auc),
+                "attribution_only_auprc": float(base_val_metrics.auprc),
+                "attribution_only_f1": float(base_val_metrics.f1),
+                "mean_pair_relative_rms": mean_pair_relative_rms,
+                "mean_abs_prob_delta": mean_abs_prob_delta,
+                "max_abs_prob_delta": float(val_pred["prob_delta"].abs().max()),
+            })
+            pd.DataFrame(stage2_history).to_csv(
+                fold_dir / "stage2_training_history.csv",
+                index=False,
+                encoding="utf-8-sig",
+                float_format="%.6f",
+            )
+            print(
+                f"Fold {fold} | Stage2 | Epoch {epoch:03d}/{args.stage2_epochs} | "
+                f"eval={evaluation_weight_source.upper()} | "
+                f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | beacon={train_beacon_loss:.4f} | "
+                f"inner_AUC={val_metrics.auc:.4f} | inner_AUPRC={val_metrics.auprc:.4f} | "
+                f"attr_AUC={base_val_metrics.auc:.4f} | "
+                f"ACC@{args.threshold:g}={val_metrics.accuracy:.4f} | F1@{args.threshold:g}={val_metrics.f1:.4f} | "
+                f"pair_rel_RMS={mean_pair_relative_rms:.4f} | |delta_p|={mean_abs_prob_delta:.6f} | "
+                f"I_min={eval_score_stats['attribution_min']:.4f} | I_max={eval_score_stats['attribution_max']:.4f}"
+            )
+
+            improved = not np.isnan(val_metrics.auc) and val_metrics.auc > best_stage2_auc
+            if improved:
+                best_stage2_auc = val_metrics.auc
+                best_stage2_metrics = val_metrics
+                no_improve = 0
+                save_checkpoint(
+                    best_stage2_path,
+                    model,
+                    epoch,
+                    val_metrics,
+                    {
+                        "input_dims": input_dims,
+                        "stage": "stage2_gme",
+                        "baseline_path": str(fold_dir / "replacement_baselines.pt"),
+                        "beacon_path": str(best_beacon_path),
+                        "beacon_constraint_weight": float(args.beacon_constraint_weight),
+                        "stage2_beacon_constraint_weight": float(stage2_beacon_weight),
+                        "freeze_projection_stage2": bool(args.freeze_projection_stage2),
+                        "stage1_path": str(stage1_path) if stage1_path.exists() else None,
+                        "routing_score_stats": eval_score_stats,
+                        "interaction_stats": eval_interaction_stats,
+                        "interaction_pair_beta": float(args.interaction_pair_beta),
+                        "interaction_scaling": "signed_train_only_rms_without_centering",
+                        "weight_averaging": args.weight_averaging,
+                        "evaluation_weight_source": evaluation_weight_source,
+                        "ema_decay": float(args.ema_decay),
+                        "ema_start_epoch": int(args.ema_start_epoch),
+                        "ema_num_updates": int(ema.num_updates) if ema is not None else 0,
+                        "baseline_policy": (
+                            "Train-only replacement baselines built once from frozen Stage1 projection."
+                            if args.freeze_projection_stage2
+                            else "Train-only replacement baselines rebuilt from current projection after each epoch."
+                        ),
+                        "beacon_policy": (
+                            "Train-only static Beacon anchors Stage1 projection geometry; Stage2 projection is frozen."
+                            if args.freeze_projection_stage2
+                            else "Train-only static Beacon used only as a detached global semantic prior constraint."
+                        ),
+                    },
+                )
+                baseline_payload = {
+                    "fold": int(fold),
+                    "baselines": {
+                        name: {key: value.detach().cpu() if torch.is_tensor(value) else value for key, value in stats.items()}
+                        for name, stats in eval_baselines.items()
+                    },
                     "input_dims": input_dims,
-                    "stage": "stage2_gme",
-                    "baseline_path": str(fold_dir / "replacement_baselines.pt"),
-                    "beacon_path": str(best_beacon_path),
-                    "beacon_constraint_weight": float(args.beacon_constraint_weight),
-                    "stage2_beacon_constraint_weight": float(stage2_beacon_weight),
-                    "freeze_projection_stage2": bool(args.freeze_projection_stage2),
-                    "stage1_path": str(stage1_path) if stage1_path.exists() else None,
-                    "routing_score_stats": score_stats,
-                    "interaction_stats": interaction_stats,
-                    "interaction_pair_beta": float(args.interaction_pair_beta),
-                    "interaction_scaling": "signed_train_only_rms_without_centering",
-                    "baseline_policy": (
+                    "encoder_names": model.encoder_names,
+                    "weight_source": evaluation_weight_source,
+                    "policy": (
                         "Train-only replacement baselines built once from frozen Stage1 projection."
                         if args.freeze_projection_stage2
-                        else "Train-only replacement baselines rebuilt from current projection after each epoch."
+                        else "Train-only replacement baselines rebuilt from the current end-to-end projection space."
                     ),
-                    "beacon_policy": (
-                        "Train-only static Beacon anchors Stage1 projection geometry; Stage2 projection is frozen."
-                        if args.freeze_projection_stage2
-                        else "Train-only static Beacon used only as a detached global semantic prior constraint."
-                    ),
-                },
-            )
-            baseline_payload = {
-                "fold": int(fold),
-                "baselines": {
-                    name: {key: value.detach().cpu() if torch.is_tensor(value) else value for key, value in stats.items()}
-                    for name, stats in baselines.items()
-                },
-                "input_dims": input_dims,
-                "encoder_names": model.encoder_names,
-                "policy": (
-                    "Train-only replacement baselines built once from frozen Stage1 projection."
-                    if args.freeze_projection_stage2
-                    else "Train-only replacement baselines rebuilt from the current end-to-end projection space."
-                ),
-                "routing_score_stats": score_stats,
-            }
-            torch.save(baseline_payload, fold_dir / "replacement_baselines.pt")
-            torch.save(
-                {
-                    **baseline_payload,
-                    "beacon": beacon.detach().cpu(),
-                    "beacon_constraint_weight": float(args.beacon_constraint_weight),
-                    "stage2_beacon_constraint_weight": float(stage2_beacon_weight),
-                    "freeze_projection_stage2": bool(args.freeze_projection_stage2),
-                    "stage1_path": str(stage1_path) if stage1_path.exists() else None,
-                    "beacon_policy": (
-                        "Train-only static Beacon anchors Stage1 projection geometry; Stage2 projection is frozen."
-                        if args.freeze_projection_stage2
-                        else "Train-only static Beacon used only as a detached global semantic prior constraint."
-                    ),
-                },
-                best_beacon_path,
-            )
-            baseline_summary.to_csv(fold_dir / "replacement_baseline_summary.csv", index=False, encoding="utf-8-sig")
-            beacon_summary.to_csv(fold_dir / "static_beacon_summary.csv", index=False, encoding="utf-8-sig")
-            save_fold_outputs(
-                fold_dir, "inner_selection", val_metrics, val_pred, val_weights,
-                interactions=val_interactions,
-            )
-        else:
-            no_improve += 1
-            if no_improve >= args.patience:
-                print(f"Fold {fold}: early stopping at epoch {epoch}. Best inner Stage2 AUC={best_stage2_auc:.4f}")
-                break
+                    "routing_score_stats": eval_score_stats,
+                }
+                torch.save(baseline_payload, fold_dir / "replacement_baselines.pt")
+                torch.save(
+                    {
+                        **baseline_payload,
+                        "beacon": eval_beacon.detach().cpu(),
+                        "beacon_constraint_weight": float(args.beacon_constraint_weight),
+                        "stage2_beacon_constraint_weight": float(stage2_beacon_weight),
+                        "freeze_projection_stage2": bool(args.freeze_projection_stage2),
+                        "stage1_path": str(stage1_path) if stage1_path.exists() else None,
+                        "beacon_policy": (
+                            "Train-only static Beacon anchors Stage1 projection geometry; Stage2 projection is frozen."
+                            if args.freeze_projection_stage2
+                            else "Train-only static Beacon used only as a detached global semantic prior constraint."
+                        ),
+                    },
+                    best_beacon_path,
+                )
+                eval_baseline_summary.to_csv(fold_dir / "replacement_baseline_summary.csv", index=False, encoding="utf-8-sig")
+                eval_beacon_summary.to_csv(fold_dir / "static_beacon_summary.csv", index=False, encoding="utf-8-sig")
+                save_fold_outputs(
+                    fold_dir, "inner_selection", val_metrics, val_pred, val_weights,
+                    interactions=val_interactions,
+                )
+            else:
+                no_improve += 1
+                if no_improve >= args.patience:
+                    print(f"Fold {fold}: early stopping at epoch {epoch}. Best inner Stage2 AUC={best_stage2_auc:.4f}")
+                    break
 
     if not best_stage2_path.exists():
         raise RuntimeError(f"Fold {fold}: no Stage2 checkpoint was selected on inner validation.")
@@ -2148,6 +2286,11 @@ def run_fold(
         T_max=max(selected_epoch, 1),
         eta_min=args.lr_stage2 * 0.01,
     )
+    retrain_ema = (
+        ExponentialMovingAverage(args.ema_decay)
+        if args.weight_averaging == "ema"
+        else None
+    )
     beacon, _, baselines, _ = build_beacon_and_baselines(
         model, baseline_ds, device, args.target_dim
     )
@@ -2159,7 +2302,13 @@ def run_fold(
         replacement_strategy=args.replacement_strategy,
         gaussian_std_scale=args.gaussian_std_scale,
     )
-    for _ in range(selected_epoch):
+    for retrain_epoch in range(1, selected_epoch + 1):
+        if (
+            retrain_ema is not None
+            and not retrain_ema.initialized
+            and retrain_epoch >= args.ema_start_epoch
+        ):
+            retrain_ema.initialize(model)
         train_stage2_epoch(
             model=model,
             dataset=train_ds,
@@ -2171,6 +2320,11 @@ def run_fold(
             replacement_strategy=args.replacement_strategy,
             gaussian_std_scale=args.gaussian_std_scale,
             grad_clip=args.grad_clip,
+            weight_averager=(
+                retrain_ema
+                if retrain_ema is not None and retrain_ema.initialized
+                else None
+            ),
         )
         retrain_scheduler.step()
         if not args.freeze_projection_stage2:
@@ -2185,7 +2339,27 @@ def run_fold(
             replacement_strategy=args.replacement_strategy,
             gaussian_std_scale=args.gaussian_std_scale,
         )
-    print(f"Fold {fold}: selected inner epoch={selected_epoch}; retrained on all outer-train slides.")
+    final_weight_source = "raw"
+    if retrain_ema is not None and retrain_ema.initialized:
+        retrain_ema.copy_to(model)
+        final_weight_source = "ema"
+        # Beacon, replacement baselines, and routing statistics must match the
+        # averaged ProjectionHead/classifier used for final evaluation.
+        beacon, _, baselines, _ = build_beacon_and_baselines(
+            model, baseline_ds, device, args.target_dim
+        )
+        _, final_interaction_stats = update_train_offline_stats(
+            model=model,
+            dataset=score_stats_ds,
+            device=device,
+            baselines=baselines,
+            replacement_strategy=args.replacement_strategy,
+            gaussian_std_scale=args.gaussian_std_scale,
+        )
+    print(
+        f"Fold {fold}: selected inner epoch={selected_epoch}; retrained on all outer-train slides; "
+        f"final weights={final_weight_source.upper()}."
+    )
 
     decision_threshold = float(args.threshold)
     print(f"Fold {fold}: fixed decision threshold={decision_threshold:.6f}")
@@ -2235,6 +2409,11 @@ def run_fold(
             "stage": "stage2_retrained_outer_train",
             "selection_policy": "inner_validation_AUC_then_retrain_on_outer_train",
             "selected_inner_epoch": selected_epoch,
+            "weight_averaging": args.weight_averaging,
+            "evaluation_weight_source": final_weight_source,
+            "ema_decay": float(args.ema_decay),
+            "ema_start_epoch": int(args.ema_start_epoch),
+            "ema_num_updates": int(retrain_ema.num_updates) if retrain_ema is not None else 0,
             "interaction_stats": final_interaction_stats,
             "interaction_pair_beta": float(args.interaction_pair_beta),
             "interaction_scaling": "signed_train_only_rms_without_centering",
@@ -2243,6 +2422,20 @@ def run_fold(
 
     with open(fold_dir / "routing_stats.json", "w", encoding="utf-8") as f:
         json.dump(model.router.get_routing_stats(), f, indent=2)
+    with open(fold_dir / "weight_averaging.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "configured_mode": args.weight_averaging,
+                "final_weight_source": final_weight_source,
+                "ema_decay": float(args.ema_decay),
+                "ema_start_epoch": int(args.ema_start_epoch),
+                "ema_num_updates": int(retrain_ema.num_updates) if retrain_ema is not None else 0,
+                "selected_inner_epoch": int(selected_epoch),
+                "offline_statistics_rebuilt_after_ema": final_weight_source == "ema",
+            },
+            f,
+            indent=2,
+        )
     with open(fold_dir / "interaction_pair_branch.json", "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -2270,6 +2463,8 @@ def run_fold(
         "fold": int(fold),
         "n_train": len(train_ds),
         "n_val": len(val_ds),
+        "weight_source": final_weight_source,
+        "ema_num_updates": int(retrain_ema.num_updates) if retrain_ema is not None else 0,
         **asdict(final_metrics),
         **efficiency,
     }
