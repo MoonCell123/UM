@@ -40,8 +40,7 @@ def l2_normalize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 class BeaconAccumulator:
-    """Streaming accumulator for train-set Beacon vectors.
-    """
+    """Accumulate one unit semantic direction per slide and encoder."""
 
     def __init__(self, target_dim: int = 512, eps: float = 1e-8, device: str | torch.device = "cpu"):
         self.target_dim = int(target_dim)
@@ -49,14 +48,36 @@ class BeaconAccumulator:
         self.device = torch.device(device)
         self._sums: Dict[str, torch.Tensor] = {}
         self._counts: Dict[str, int] = {}
+        self._patch_counts: Dict[str, int] = {}
 
     def reset(self) -> None:
         self._sums.clear()
         self._counts.clear()
+        self._patch_counts.clear()
+
+    def _accumulate_slide_direction(
+        self,
+        encoder_name: str,
+        normalized_patch_sum: torch.Tensor,
+        patch_count: int,
+    ) -> None:
+        if patch_count <= 0:
+            raise ValueError(f"{encoder_name}: cannot build a slide direction from {patch_count} patches")
+        slide_mean = normalized_patch_sum / int(patch_count)
+        slide_direction = l2_normalize(slide_mean, eps=self.eps)
+
+        if encoder_name not in self._sums:
+            self._sums[encoder_name] = torch.zeros(self.target_dim, device=self.device)
+            self._counts[encoder_name] = 0
+            self._patch_counts[encoder_name] = 0
+
+        self._sums[encoder_name] += slide_direction
+        self._counts[encoder_name] += 1
+        self._patch_counts[encoder_name] += int(patch_count)
 
     @torch.no_grad()
     def update(self, encoder_name: str, projected_embeddings: torch.Tensor) -> None:
-        """Accumulate projected embeddings for one encoder.
+        """Accumulate one complete slide for one encoder.
 
         Args:
             encoder_name: Name matching the feature_dir/model encoder.
@@ -70,16 +91,39 @@ class BeaconAccumulator:
 
         h = projected_embeddings.detach().to(self.device).reshape(-1, self.target_dim)
         h = l2_normalize(h, eps=self.eps)
+        self._accumulate_slide_direction(
+            encoder_name=encoder_name,
+            normalized_patch_sum=h.sum(dim=0),
+            patch_count=int(h.shape[0]),
+        )
 
-        if encoder_name not in self._sums:
-            self._sums[encoder_name] = torch.zeros(self.target_dim, device=self.device)
-            self._counts[encoder_name] = 0
-
-        self._sums[encoder_name] += h.sum(dim=0)
-        self._counts[encoder_name] += int(h.shape[0])
+    @torch.no_grad()
+    def update_chunks(
+        self,
+        encoder_name: str,
+        projected_chunks: Iterable[torch.Tensor],
+    ) -> None:
+        """Accumulate one slide streamed in chunks without counting chunks as slides."""
+        normalized_patch_sum = torch.zeros(self.target_dim, device=self.device)
+        patch_count = 0
+        for projected_embeddings in projected_chunks:
+            if projected_embeddings.shape[-1] != self.target_dim:
+                raise ValueError(
+                    f"{encoder_name}: expected last dim {self.target_dim}, "
+                    f"got {projected_embeddings.shape[-1]}"
+                )
+            h = projected_embeddings.detach().to(self.device).reshape(-1, self.target_dim)
+            h = l2_normalize(h, eps=self.eps)
+            normalized_patch_sum += h.sum(dim=0)
+            patch_count += int(h.shape[0])
+        self._accumulate_slide_direction(
+            encoder_name=encoder_name,
+            normalized_patch_sum=normalized_patch_sum,
+            patch_count=patch_count,
+        )
 
     def encoder_means(self) -> Dict[str, torch.Tensor]:
-        """Return per-encoder mean normalized embeddings, i.e. bar{h}_m."""
+        """Return the mean slide direction for each encoder."""
         means = {}
         for encoder_name, total in self._sums.items():
             count = self._counts[encoder_name]
@@ -109,6 +153,9 @@ class BeaconAccumulator:
             rows.append({
                 "encoder_name": encoder_name,
                 "count": self._counts[encoder_name],
+                "slide_count": self._counts[encoder_name],
+                "patch_count": self._patch_counts[encoder_name],
+                "aggregation": "equal_weight_per_slide",
                 "sum_norm": float(self._sums[encoder_name].norm().detach().cpu()),
             })
         return pd.DataFrame(rows)
@@ -329,8 +376,10 @@ def build_beacon_from_manifest(
         dataset_key = str(row["dataset_key"]) if "dataset_key" in row and pd.notna(row["dataset_key"]) else None
         raw_features = read_h5_features(h5_path, dataset_key=dataset_key)
         head = projection_heads[feature_dir].to(device)
-        for projected in _project_in_batches(raw_features, head, device, batch_size):
-            accumulator.update(feature_dir, projected)
+        accumulator.update_chunks(
+            feature_dir,
+            _project_in_batches(raw_features, head, device, batch_size),
+        )
 
     beacon = accumulator.compute(normalize_beacon=normalize_beacon)
     return beacon, accumulator.summary()
