@@ -1960,36 +1960,25 @@ def run_fold(
     no_improve = 0
     stage2_history: List[Dict[str, float | int]] = []
 
-    static_beacon = static_beacon_summary = static_baselines = static_baseline_summary = None
-    if args.freeze_projection_stage2:
-        static_beacon, static_beacon_summary, static_baselines, static_baseline_summary = build_beacon_and_baselines(
-            model,
-            inner_baseline_ds,
-            device,
-            args.target_dim,
-        )
+    # Initialize train-only offline statistics once. After every epoch they are
+    # refreshed for the updated model, used for validation, and carried into
+    # the next epoch instead of being rebuilt again at the same checkpoint.
+    beacon, beacon_summary, baselines, baseline_summary = build_beacon_and_baselines(
+        model,
+        inner_baseline_ds,
+        device,
+        args.target_dim,
+    )
+    score_stats, interaction_stats = update_train_offline_stats(
+        model=model,
+        dataset=inner_score_stats_ds,
+        device=device,
+        baselines=baselines,
+        replacement_strategy=args.replacement_strategy,
+        gaussian_std_scale=args.gaussian_std_scale,
+    )
 
     for epoch in range(1, args.stage2_epochs + 1):
-        if args.freeze_projection_stage2:
-            beacon = static_beacon
-            beacon_summary = static_beacon_summary
-            baselines = static_baselines
-            baseline_summary = static_baseline_summary
-        else:
-            beacon, beacon_summary, baselines, baseline_summary = build_beacon_and_baselines(
-                model,
-                inner_baseline_ds,
-                device,
-                args.target_dim,
-            )
-        score_stats, interaction_stats = update_train_offline_stats(
-            model=model,
-            dataset=inner_score_stats_ds,
-            device=device,
-            baselines=baselines,
-            replacement_strategy=args.replacement_strategy,
-            gaussian_std_scale=args.gaussian_std_scale,
-        )
         train_loss, train_cls_loss, train_beacon_loss = train_stage2_epoch(
             model=model,
             dataset=inner_train_ds,
@@ -2159,24 +2148,18 @@ def run_fold(
         T_max=max(selected_epoch, 1),
         eta_min=args.lr_stage2 * 0.01,
     )
-    static_outer = None
-    if args.freeze_projection_stage2:
-        static_outer = build_beacon_and_baselines(model, baseline_ds, device, args.target_dim)
+    beacon, _, baselines, _ = build_beacon_and_baselines(
+        model, baseline_ds, device, args.target_dim
+    )
+    _, final_interaction_stats = update_train_offline_stats(
+        model=model,
+        dataset=score_stats_ds,
+        device=device,
+        baselines=baselines,
+        replacement_strategy=args.replacement_strategy,
+        gaussian_std_scale=args.gaussian_std_scale,
+    )
     for _ in range(selected_epoch):
-        if static_outer is None:
-            beacon, _, baselines, _ = build_beacon_and_baselines(
-                model, baseline_ds, device, args.target_dim
-            )
-        else:
-            beacon, _, baselines, _ = static_outer
-        update_train_offline_stats(
-            model=model,
-            dataset=score_stats_ds,
-            device=device,
-            baselines=baselines,
-            replacement_strategy=args.replacement_strategy,
-            gaussian_std_scale=args.gaussian_std_scale,
-        )
         train_stage2_epoch(
             model=model,
             dataset=train_ds,
@@ -2190,18 +2173,18 @@ def run_fold(
             grad_clip=args.grad_clip,
         )
         retrain_scheduler.step()
-
-    beacon, _, baselines, _ = build_beacon_and_baselines(
-        model, baseline_ds, device, args.target_dim
-    )
-    _, final_interaction_stats = update_train_offline_stats(
-        model=model,
-        dataset=score_stats_ds,
-        device=device,
-        baselines=baselines,
-        replacement_strategy=args.replacement_strategy,
-        gaussian_std_scale=args.gaussian_std_scale,
-    )
+        if not args.freeze_projection_stage2:
+            beacon, _, baselines, _ = build_beacon_and_baselines(
+                model, baseline_ds, device, args.target_dim
+            )
+        _, final_interaction_stats = update_train_offline_stats(
+            model=model,
+            dataset=score_stats_ds,
+            device=device,
+            baselines=baselines,
+            replacement_strategy=args.replacement_strategy,
+            gaussian_std_scale=args.gaussian_std_scale,
+        )
     print(f"Fold {fold}: selected inner epoch={selected_epoch}; retrained on all outer-train slides.")
 
     decision_threshold = float(args.threshold)
