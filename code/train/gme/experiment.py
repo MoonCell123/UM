@@ -987,7 +987,7 @@ def run_fold(
         split="train",
         clinical_df=clinical_df,
         label_col=args.label_col,
-        max_patches=args.max_patches,
+        max_patches=0,
         training=False,
     )
     inner_train_indices, inner_val_indices = stratified_split_indices(
@@ -1409,7 +1409,7 @@ def run_fold(
     retrain_optimizer = build_stage2_optimizer(model, args)
     retrain_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         retrain_optimizer,
-        T_max=max(selected_epoch, 1),
+        T_max=max(args.stage2_epochs, 1),
         eta_min=args.lr_stage2 * 0.01,
     )
     retrain_ema = (

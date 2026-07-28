@@ -39,11 +39,12 @@ freeze_projection_stage2: false
 stage2_warm_start_classifier: false
 
 stage2_epochs: 80
-patience: 5
+patience: 7
 inner_val_fraction: 0.2
 lr_stage2: 0.0001
 weight_decay: 0.001
 grad_clip: 5.0
+
 weight_averaging: "none"    # EMA or SWA
 ema_decay: 0.95
 ema_start_epoch: 3
