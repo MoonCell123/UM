@@ -421,13 +421,12 @@ PyYAML>=6.0
 
 对应代码位置：
 
-- Projection：`GMEModel.project()`，在 [train_gme.py]
-- Similarity：`similarity_scores()`，在 [train_gme.py]
-- Attribution：`intervention_attribution()`，在 [train_gme.py]
-- Routing + final fusion：`route_with_scores()` 和 `forward_stage2()`，在 [train_gme.py]、[train_gme.py]
-- Build static Beacon：`build_beacon_and_baselines()`，在 [train_gme.py]
-- Freeze projection：在 [train_gme.py]
-- 5-fold loop：在 [train_gme.py]
+- CLI 入口：`train/train_gme.py`（保持原命令兼容）
+- CLI 参数与 YAML/JSON 配置：`train/gme/config.py`
+- GME 网络、Attribution、Routing 与 joint fusion：`architecture/gme_model.py`
+- 多编码器 H5 数据读取与 patch 对齐：`data_utils/gme_dataset.py`
+- FLOPs、参数量和推理耗时：`train/gme/profiling.py`
+- Build static Beacon、训练阶段与 5-fold 实验编排：`train/gme/experiment.py`
 
 python code\train\train_gme.py --config code\config\gme.yml
 python code\train\train_offline_fusion_baselines.py --config code\config\offline_fusion_baselines.yml
