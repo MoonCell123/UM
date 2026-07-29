@@ -1298,7 +1298,6 @@ def run_fold(
                 f"Fold {fold} | Epoch {epoch:03d}/{args.stage2_epochs} | "
                 f"eval={evaluation_weight_source.upper()} | "
                 f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | beacon={train_beacon_loss:.4f} | "
-                f"lambda_B={next_beacon_weight:.6f} | "
                 f"inner_AUC={val_metrics.auc:.4f} | inner_AUPRC={val_metrics.auprc:.4f} | "
                 f"attr_AUC={base_val_metrics.auc:.4f} | "
                 f"ACC@{args.threshold:g}={val_metrics.accuracy:.4f} | F1@{args.threshold:g}={val_metrics.f1:.4f} | "
