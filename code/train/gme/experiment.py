@@ -1126,11 +1126,9 @@ def run_fold(
             print("[Warning] Stage1 is projection-only, so there is no pretrained classifier to warm-start.")
         reset_stage2_classifier(model, args, device)
         stage2_beacon_weight = 0.0
-        print("Stage2: ProjectionHead frozen; Beacon is static analysis/geometry prior, not a trainable loss term.")
     else:
         set_projection_trainable(model, True)
         stage2_beacon_weight = float(args.beacon_constraint_weight)
-        print("Stage2: ProjectionHead remains trainable; Beacon constraint stays active in Stage2.")
 
     initial_stage2_state = {
         name: value.detach().clone() for name, value in model.state_dict().items()
@@ -1149,24 +1147,23 @@ def run_fold(
         if args.weight_averaging == "ema"
         else None
     )
-    print(
-        f"Stage2 evaluation weights: {args.weight_averaging}"
-        + (
-            f" | decay={args.ema_decay:g} | start_epoch={args.ema_start_epoch}"
-            if ema is not None
-            else ""
+    if ema is not None:
+        print(
+            f"evaluation weights: {args.weight_averaging}"
+            + (
+                f" | decay={args.ema_decay:g} | start_epoch={args.ema_start_epoch}"
+                if ema is not None
+                else ""
+            )
         )
-    )
     current_stage2_beacon_weight = float(stage2_beacon_weight)
-    print(
-        f"Stage2 Beacon weighting: initial={current_stage2_beacon_weight:g} | "
-        f"adaptive={bool(args.adaptive_beacon_weight)} | "
-        f"max_weighted_loss_ratio={args.beacon_loss_ratio:g}"
-    )
+    if(bool(args.adaptive_beacon_weight)):
+        print(
+            f"Beacon weighting: initial={current_stage2_beacon_weight:g} | "
+            f"adaptive={bool(args.adaptive_beacon_weight)} | "
+            f"max_weighted_loss_ratio={args.beacon_loss_ratio:g}"
+        )
 
-    # Initialize train-only offline statistics once. After every epoch they are
-    # refreshed for the updated model, used for validation, and carried into
-    # the next epoch instead of being rebuilt again at the same checkpoint.
     beacon, beacon_summary, baselines, baseline_summary = build_beacon_and_baselines(
         model,
         inner_baseline_ds,
