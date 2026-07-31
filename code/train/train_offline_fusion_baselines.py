@@ -144,6 +144,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional encoder names for no_fusion. Default: all encoders in each fold.",
     )
     parser.add_argument("--folds", type=int, nargs="*", default=None)
+    parser.add_argument(
+        "--training-protocol",
+        choices=["nested_refit", "fixed_split_no_refit"],
+        default="nested_refit",
+        help=(
+            "'nested_refit' selects an epoch on inner validation and retrains on all outer-train data. "
+            "'fixed_split_no_refit' evaluates the selected inner checkpoint directly on outer-test."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--gpu-id", type=int, default=None, help="CUDA device index used when --device is 'cuda'.")
@@ -941,7 +950,7 @@ def train_fold(
     inner_val_ds = Subset(train_eval_ds, inner_val_indices)
 
     print(
-        f"\n{model_name} | fold {fold}: outer_train={len(train_ds)}, outer_val={len(val_ds)}, "
+        f"\n{model_name} | fold {fold}: outer_train={len(train_ds)}, outer_test={len(val_ds)}, "
         f"inner_train={len(inner_train_ds)}, inner_val={len(inner_val_ds)}, encoders={encoder_names}"
     )
     for epoch in range(1, args.max_epochs + 1):
@@ -979,9 +988,14 @@ def train_fold(
                 print(f"{model_name} | fold {fold}: early stopping at epoch {epoch}. Best AUC={best_auc:.4f}")
                 break
 
-    if best_path.exists():
-        payload = torch.load(best_path, map_location=device)
-        selected_epoch = int(payload.get("epoch", best_epoch))
+    if not best_path.exists():
+        raise RuntimeError(
+            f"{model_name} | fold {fold}: no checkpoint was selected on inner validation."
+        )
+
+    payload = torch.load(best_path, map_location=device)
+    selected_epoch = int(payload.get("epoch", best_epoch))
+    if args.training_protocol == "nested_refit":
         model.load_state_dict(initial_state)
         seed_everything(args.seed + fold)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -991,15 +1005,52 @@ def train_fold(
         for _ in range(selected_epoch):
             train_one_epoch(model, train_ds, optimizer, device, args.grad_clip)
             scheduler.step()
-        torch.save(
-            {
-                **payload,
-                "state_dict": model.state_dict(),
-                "epoch": selected_epoch,
-                "selection_policy": "inner_validation_AUC_then_retrain_on_outer_train",
-            },
-            best_path,
+        final_train_count = len(train_ds)
+        checkpoint_stage = "retrained_outer_train"
+        selection_policy = "inner_validation_AUC_then_retrain_on_outer_train"
+        print(
+            f"{model_name} | fold {fold}: selected inner epoch={selected_epoch}; "
+            "retrained on all outer-train slides."
         )
+    else:
+        model.load_state_dict(payload["state_dict"])
+        final_train_count = len(inner_train_ds)
+        checkpoint_stage = "selected_inner_checkpoint_no_refit"
+        selection_policy = "fixed_train_validation_test_best_checkpoint_no_refit"
+        split_rows = [
+            {"slide_id": train_ds.slide_ids[int(index)], "split": "train"}
+            for index in inner_train_indices
+        ]
+        split_rows.extend(
+            {"slide_id": train_ds.slide_ids[int(index)], "split": "validation"}
+            for index in inner_val_indices
+        )
+        split_rows.extend(
+            {"slide_id": slide_id, "split": "test"}
+            for slide_id in val_ds.slide_ids
+        )
+        pd.DataFrame(split_rows).to_csv(
+            fold_dir / "fixed_split_assignments.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        print(
+            f"{model_name} | fold {fold}: selected inner epoch={selected_epoch}; "
+            "using selected checkpoint directly without outer retraining."
+        )
+
+    torch.save(
+        {
+            **payload,
+            "state_dict": model.state_dict(),
+            "epoch": selected_epoch,
+            "stage": checkpoint_stage,
+            "training_protocol": args.training_protocol,
+            "selection_policy": selection_policy,
+            "selected_inner_epoch": selected_epoch,
+        },
+        best_path,
+    )
     decision_threshold = float(args.threshold)
     print(f"{model_name} | fold {fold}: fixed decision threshold={decision_threshold:.6f}")
     with open(fold_dir / "decision_threshold.json", "w", encoding="utf-8") as f:
@@ -1028,7 +1079,10 @@ def train_fold(
         "method": method,
         "model_name": model_name,
         "fold": int(fold),
-        "n_train": len(train_ds),
+        "training_protocol": args.training_protocol,
+        "n_train": int(final_train_count),
+        "n_selection_val": len(inner_val_ds),
+        "n_test": len(val_ds),
         "n_val": len(val_ds),
         "encoders": ",".join(encoder_names),
         **asdict(final_metrics),
@@ -1138,6 +1192,12 @@ def main() -> None:
     print(f"Clinical: {args.clinical_path}")
     print(f"Methods: {methods}")
     print(f"Folds: {folds}")
+    print(f"Training protocol: {args.training_protocol}")
+    if args.training_protocol == "fixed_split_no_refit" and len(folds) > 1:
+        print(
+            "[Note] fixed_split_no_refit runs once per selected fold. "
+            "Set folds: [1] for a single fixed train/validation/test experiment."
+        )
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"CUDA device: {torch.cuda.current_device()} | {torch.cuda.get_device_name(device)}")
