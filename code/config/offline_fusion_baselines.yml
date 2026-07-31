@@ -20,6 +20,8 @@ methods:
   - "all"
 single_encoders: null
 folds: null
+# Small dataset: nested_refit. Large dataset: fixed_split_no_refit with folds: [1].
+training_protocol: "fixed_split_no_refit"
 seed: 42
 device: "cuda"
 gpu_id: 1

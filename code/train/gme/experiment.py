@@ -1126,11 +1126,9 @@ def run_fold(
             print("[Warning] Stage1 is projection-only, so there is no pretrained classifier to warm-start.")
         reset_stage2_classifier(model, args, device)
         stage2_beacon_weight = 0.0
-        print("Stage2: ProjectionHead frozen; Beacon is static analysis/geometry prior, not a trainable loss term.")
     else:
         set_projection_trainable(model, True)
         stage2_beacon_weight = float(args.beacon_constraint_weight)
-        print("Stage2: ProjectionHead remains trainable; Beacon constraint stays active in Stage2.")
 
     initial_stage2_state = {
         name: value.detach().clone() for name, value in model.state_dict().items()
@@ -1149,24 +1147,23 @@ def run_fold(
         if args.weight_averaging == "ema"
         else None
     )
-    print(
-        f"Stage2 evaluation weights: {args.weight_averaging}"
-        + (
-            f" | decay={args.ema_decay:g} | start_epoch={args.ema_start_epoch}"
-            if ema is not None
-            else ""
+    if ema is not None:
+        print(
+            f"evaluation weights: {args.weight_averaging}"
+            + (
+                f" | decay={args.ema_decay:g} | start_epoch={args.ema_start_epoch}"
+                if ema is not None
+                else ""
+            )
         )
-    )
     current_stage2_beacon_weight = float(stage2_beacon_weight)
-    print(
-        f"Stage2 Beacon weighting: initial={current_stage2_beacon_weight:g} | "
-        f"adaptive={bool(args.adaptive_beacon_weight)} | "
-        f"max_weighted_loss_ratio={args.beacon_loss_ratio:g}"
-    )
+    if(bool(args.adaptive_beacon_weight)):
+        print(
+            f"Beacon weighting: initial={current_stage2_beacon_weight:g} | "
+            f"adaptive={bool(args.adaptive_beacon_weight)} | "
+            f"max_weighted_loss_ratio={args.beacon_loss_ratio:g}"
+        )
 
-    # Initialize train-only offline statistics once. After every epoch they are
-    # refreshed for the updated model, used for validation, and carried into
-    # the next epoch instead of being rebuilt again at the same checkpoint.
     beacon, beacon_summary, baselines, baseline_summary = build_beacon_and_baselines(
         model,
         inner_baseline_ds,
@@ -1296,9 +1293,7 @@ def run_fold(
             )
             print(
                 f"Fold {fold} | Epoch {epoch:03d}/{args.stage2_epochs} | "
-                f"eval={evaluation_weight_source.upper()} | "
                 f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | beacon={train_beacon_loss:.4f} | "
-                f"lambda_B={next_beacon_weight:.6f} | "
                 f"inner_AUC={val_metrics.auc:.4f} | inner_AUPRC={val_metrics.auprc:.4f} | "
                 f"attr_AUC={base_val_metrics.auc:.4f} | "
                 f"ACC@{args.threshold:g}={val_metrics.accuracy:.4f} | F1@{args.threshold:g}={val_metrics.f1:.4f} | "
@@ -1404,84 +1399,23 @@ def run_fold(
 
     selected_payload = torch.load(best_stage2_path, map_location=device)
     selected_epoch = int(selected_payload.get("epoch", 1))
-    model.load_state_dict(initial_stage2_state)
-    seed_everything(args.seed + fold)
-    retrain_optimizer = build_stage2_optimizer(model, args)
-    retrain_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        retrain_optimizer,
-        T_max=max(args.stage2_epochs, 1),
-        eta_min=args.lr_stage2 * 0.01,
-    )
-    retrain_ema = (
-        ExponentialMovingAverage(args.ema_decay)
-        if args.weight_averaging == "ema"
-        else None
-    )
-    retrain_beacon_weight = float(stage2_beacon_weight)
-    last_retrain_beacon_weight = float(stage2_beacon_weight)
-    beacon, _, baselines, _ = build_beacon_and_baselines(
-        model, baseline_ds, device, args.target_dim
-    )
-    _, final_interaction_stats = update_train_offline_stats(
-        model=model,
-        dataset=score_stats_ds,
-        device=device,
-        baselines=baselines,
-        replacement_strategy=args.replacement_strategy,
-        gaussian_std_scale=args.gaussian_std_scale,
-    )
-    for retrain_epoch in range(1, selected_epoch + 1):
-        if (
-            retrain_ema is not None
-            and not retrain_ema.initialized
-            and retrain_epoch >= args.ema_start_epoch
-        ):
-            retrain_ema.initialize(model)
-        last_retrain_beacon_weight = float(retrain_beacon_weight)
-        _, retrain_cls_loss, retrain_beacon_loss = train_stage2_epoch(
-            model=model,
-            dataset=train_ds,
-            optimizer=retrain_optimizer,
-            device=device,
-            baselines=baselines,
-            beacon=beacon,
-            beacon_constraint_weight=last_retrain_beacon_weight,
-            replacement_strategy=args.replacement_strategy,
-            gaussian_std_scale=args.gaussian_std_scale,
-            grad_clip=args.grad_clip,
-            weight_averager=(
-                retrain_ema
-                if retrain_ema is not None and retrain_ema.initialized
-                else None
-            ),
+    retrain_ema: ExponentialMovingAverage | None = None
+    if args.training_protocol == "nested_refit":
+        model.load_state_dict(initial_stage2_state)
+        seed_everything(args.seed + fold)
+        retrain_optimizer = build_stage2_optimizer(model, args)
+        retrain_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            retrain_optimizer,
+            T_max=max(args.stage2_epochs, 1),
+            eta_min=args.lr_stage2 * 0.01,
         )
-        retrain_beacon_weight = next_stage2_beacon_weight(
-            current_weight=last_retrain_beacon_weight,
-            initial_weight=stage2_beacon_weight,
-            train_cls_loss=retrain_cls_loss,
-            train_beacon_loss=retrain_beacon_loss,
-            adaptive=bool(args.adaptive_beacon_weight),
-            max_loss_ratio=float(args.beacon_loss_ratio),
+        retrain_ema = (
+            ExponentialMovingAverage(args.ema_decay)
+            if args.weight_averaging == "ema"
+            else None
         )
-        retrain_scheduler.step()
-        if not args.freeze_projection_stage2:
-            beacon, _, baselines, _ = build_beacon_and_baselines(
-                model, baseline_ds, device, args.target_dim
-            )
-        _, final_interaction_stats = update_train_offline_stats(
-            model=model,
-            dataset=score_stats_ds,
-            device=device,
-            baselines=baselines,
-            replacement_strategy=args.replacement_strategy,
-            gaussian_std_scale=args.gaussian_std_scale,
-        )
-    final_weight_source = "raw"
-    if retrain_ema is not None and retrain_ema.initialized:
-        retrain_ema.copy_to(model)
-        final_weight_source = "ema"
-        # Beacon, replacement baselines, and routing statistics must match the
-        # averaged ProjectionHead/classifier used for final evaluation.
+        retrain_beacon_weight = float(stage2_beacon_weight)
+        last_retrain_beacon_weight = float(stage2_beacon_weight)
         beacon, _, baselines, _ = build_beacon_and_baselines(
             model, baseline_ds, device, args.target_dim
         )
@@ -1493,11 +1427,134 @@ def run_fold(
             replacement_strategy=args.replacement_strategy,
             gaussian_std_scale=args.gaussian_std_scale,
         )
-    print(
-        f"Fold {fold}: selected inner epoch={selected_epoch}; retrained on all outer-train slides; "
-        f"final weights={final_weight_source.upper()}; "
-        f"last lambda_B={last_retrain_beacon_weight:.6f}."
-    )
+        for retrain_epoch in range(1, selected_epoch + 1):
+            if (
+                retrain_ema is not None
+                and not retrain_ema.initialized
+                and retrain_epoch >= args.ema_start_epoch
+            ):
+                retrain_ema.initialize(model)
+            last_retrain_beacon_weight = float(retrain_beacon_weight)
+            _, retrain_cls_loss, retrain_beacon_loss = train_stage2_epoch(
+                model=model,
+                dataset=train_ds,
+                optimizer=retrain_optimizer,
+                device=device,
+                baselines=baselines,
+                beacon=beacon,
+                beacon_constraint_weight=last_retrain_beacon_weight,
+                replacement_strategy=args.replacement_strategy,
+                gaussian_std_scale=args.gaussian_std_scale,
+                grad_clip=args.grad_clip,
+                weight_averager=(
+                    retrain_ema
+                    if retrain_ema is not None and retrain_ema.initialized
+                    else None
+                ),
+            )
+            retrain_beacon_weight = next_stage2_beacon_weight(
+                current_weight=last_retrain_beacon_weight,
+                initial_weight=stage2_beacon_weight,
+                train_cls_loss=retrain_cls_loss,
+                train_beacon_loss=retrain_beacon_loss,
+                adaptive=bool(args.adaptive_beacon_weight),
+                max_loss_ratio=float(args.beacon_loss_ratio),
+            )
+            retrain_scheduler.step()
+            if not args.freeze_projection_stage2:
+                beacon, _, baselines, _ = build_beacon_and_baselines(
+                    model, baseline_ds, device, args.target_dim
+                )
+            _, final_interaction_stats = update_train_offline_stats(
+                model=model,
+                dataset=score_stats_ds,
+                device=device,
+                baselines=baselines,
+                replacement_strategy=args.replacement_strategy,
+                gaussian_std_scale=args.gaussian_std_scale,
+            )
+        final_weight_source = "raw"
+        if retrain_ema is not None and retrain_ema.initialized:
+            retrain_ema.copy_to(model)
+            final_weight_source = "ema"
+            # Offline statistics must match the averaged model used for test.
+            beacon, _, baselines, _ = build_beacon_and_baselines(
+                model, baseline_ds, device, args.target_dim
+            )
+            _, final_interaction_stats = update_train_offline_stats(
+                model=model,
+                dataset=score_stats_ds,
+                device=device,
+                baselines=baselines,
+                replacement_strategy=args.replacement_strategy,
+                gaussian_std_scale=args.gaussian_std_scale,
+            )
+        final_ema_num_updates = (
+            int(retrain_ema.num_updates) if retrain_ema is not None else 0
+        )
+        final_train_count = len(train_ds)
+        checkpoint_stage = "stage2_retrained_outer_train"
+        selection_policy = "inner_validation_AUC_then_retrain_on_outer_train"
+        print(
+            f"Fold {fold}: selected inner epoch={selected_epoch}; retrained on all outer-train slides; "
+            f"final weights={final_weight_source.upper()}; "
+            f"last lambda_B={last_retrain_beacon_weight:.6f}."
+        )
+    else:
+        # The selected checkpoint is already the model evaluated on inner
+        # validation. Test it directly; never expose outer-test to training or
+        # checkpoint selection, and do not refit on inner-validation slides.
+        model.load_state_dict(selected_payload["state_dict"])
+        final_weight_source = str(selected_payload.get("evaluation_weight_source", "raw"))
+        final_ema_num_updates = int(selected_payload.get("ema_num_updates", 0))
+        last_retrain_beacon_weight = float(
+            selected_payload.get("stage2_beacon_constraint_weight", stage2_beacon_weight)
+        )
+        retrain_beacon_weight = float(
+            selected_payload.get("next_stage2_beacon_constraint_weight", last_retrain_beacon_weight)
+        )
+        beacon, beacon_summary, baselines, baseline_summary = build_beacon_and_baselines(
+            model, inner_baseline_ds, device, args.target_dim
+        )
+        _, final_interaction_stats = update_train_offline_stats(
+            model=model,
+            dataset=inner_score_stats_ds,
+            device=device,
+            baselines=baselines,
+            replacement_strategy=args.replacement_strategy,
+            gaussian_std_scale=args.gaussian_std_scale,
+        )
+        baseline_summary.to_csv(
+            fold_dir / "replacement_baseline_summary.csv", index=False, encoding="utf-8-sig"
+        )
+        beacon_summary.to_csv(
+            fold_dir / "static_beacon_summary.csv", index=False, encoding="utf-8-sig"
+        )
+        final_train_count = len(inner_train_ds)
+        checkpoint_stage = "stage2_selected_inner_checkpoint_no_refit"
+        selection_policy = "fixed_train_validation_test_best_checkpoint_no_refit"
+        split_rows = [
+            {"slide_id": train_ds.slide_ids[int(index)], "split": "train"}
+            for index in inner_train_indices
+        ]
+        split_rows.extend(
+            {"slide_id": train_ds.slide_ids[int(index)], "split": "validation"}
+            for index in inner_val_indices
+        )
+        split_rows.extend(
+            {"slide_id": slide_id, "split": "test"}
+            for slide_id in val_ds.slide_ids
+        )
+        pd.DataFrame(split_rows).to_csv(
+            fold_dir / "fixed_split_assignments.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        print(
+            f"Fold {fold}: selected inner epoch={selected_epoch}; using selected checkpoint directly; "
+            f"train={len(inner_train_ds)}, validation={len(inner_val_ds)}, test={len(val_ds)}; "
+            f"final weights={final_weight_source.upper()}; no outer retrain."
+        )
 
     decision_threshold = float(args.threshold)
     print(f"Fold {fold}: fixed decision threshold={decision_threshold:.6f}")
@@ -1544,14 +1601,15 @@ def run_fold(
         final_metrics,
         {
             "input_dims": input_dims,
-            "stage": "stage2_retrained_outer_train",
-            "selection_policy": "inner_validation_AUC_then_retrain_on_outer_train",
+            "stage": checkpoint_stage,
+            "training_protocol": args.training_protocol,
+            "selection_policy": selection_policy,
             "selected_inner_epoch": selected_epoch,
             "weight_averaging": args.weight_averaging,
             "evaluation_weight_source": final_weight_source,
             "ema_decay": float(args.ema_decay),
             "ema_start_epoch": int(args.ema_start_epoch),
-            "ema_num_updates": int(retrain_ema.num_updates) if retrain_ema is not None else 0,
+            "ema_num_updates": int(final_ema_num_updates),
             "adaptive_beacon_weight": bool(args.adaptive_beacon_weight),
             "beacon_loss_ratio": float(args.beacon_loss_ratio),
             "initial_stage2_beacon_constraint_weight": float(stage2_beacon_weight),
@@ -1568,11 +1626,12 @@ def run_fold(
     with open(fold_dir / "weight_averaging.json", "w", encoding="utf-8") as f:
         json.dump(
             {
+                "training_protocol": args.training_protocol,
                 "configured_mode": args.weight_averaging,
                 "final_weight_source": final_weight_source,
                 "ema_decay": float(args.ema_decay),
                 "ema_start_epoch": int(args.ema_start_epoch),
-                "ema_num_updates": int(retrain_ema.num_updates) if retrain_ema is not None else 0,
+                "ema_num_updates": int(final_ema_num_updates),
                 "selected_inner_epoch": int(selected_epoch),
                 "offline_statistics_rebuilt_after_ema": final_weight_source == "ema",
             },
@@ -1582,6 +1641,7 @@ def run_fold(
     with open(fold_dir / "adaptive_beacon.json", "w", encoding="utf-8") as f:
         json.dump(
             {
+                "training_protocol": args.training_protocol,
                 "enabled": bool(args.adaptive_beacon_weight),
                 "initial_weight": float(stage2_beacon_weight),
                 "max_weighted_loss_ratio": float(args.beacon_loss_ratio),
@@ -1619,10 +1679,13 @@ def run_fold(
 
     row = {
         "fold": int(fold),
-        "n_train": len(train_ds),
+        "training_protocol": args.training_protocol,
+        "n_train": int(final_train_count),
+        "n_selection_val": len(inner_val_ds),
+        "n_test": len(val_ds),
         "n_val": len(val_ds),
         "weight_source": final_weight_source,
-        "ema_num_updates": int(retrain_ema.num_updates) if retrain_ema is not None else 0,
+        "ema_num_updates": int(final_ema_num_updates),
         "adaptive_beacon_weight": bool(args.adaptive_beacon_weight),
         "final_beacon_weight": float(last_retrain_beacon_weight),
         **asdict(final_metrics),
@@ -1663,6 +1726,12 @@ def main() -> None:
     print(f"Manifest: {manifest_path}")
     print(f"Clinical: {args.clinical_path}")
     print(f"Folds: {folds}")
+    print(f"Training protocol: {args.training_protocol}")
+    if args.training_protocol == "fixed_split_no_refit" and len(folds) > 1:
+        print(
+            "[Note] fixed_split_no_refit runs once per selected fold. "
+            "Set folds: [1] for a single fixed train/validation/test experiment."
+        )
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"CUDA device: {torch.cuda.current_device()} | {torch.cuda.get_device_name(device)}")

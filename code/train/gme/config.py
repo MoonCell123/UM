@@ -76,6 +76,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--label-col", default="d3m3")
     parser.add_argument("--folds", type=int, nargs="*", default=None, help="Fold ids to run. Default: all folds.")
+    parser.add_argument(
+        "--training-protocol",
+        choices=["nested_refit", "fixed_split_no_refit"],
+        default="nested_refit",
+        help=(
+            "'nested_refit' selects an epoch on inner validation and retrains on all outer-train data. "
+            "'fixed_split_no_refit' evaluates the selected inner checkpoint directly on outer-test."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--gpu-id", type=int, default=None, help="CUDA device index used when --device is 'cuda'.")
