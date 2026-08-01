@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from architecture.abmil_cls import ABMIL_Cls
 from architecture.projection_head import MultiEncoderProjectionHead
 from modules.attribution import replace_encoder_embedding
-from modules.routing import DualConsistencyRouter
+from modules.routing import DualConsistencyRouter, EmbeddingStudentRouter
 
 
 def class_logit_margin(logits: torch.Tensor, class_index: int) -> torch.Tensor:
@@ -44,6 +44,8 @@ class GMEModel(nn.Module):
         attribution_target: str = "predicted_class",
         interaction_pair_beta: float = 0.1,
         interaction_rms_clip: float = 3.0,
+        student_router_hidden_dim: int = 0,
+        student_router_temperature: float = 1.0,
     ):
         super().__init__()
         self.encoder_names = sorted(input_dims.keys())
@@ -56,6 +58,16 @@ class GMEModel(nn.Module):
         self.router = DualConsistencyRouter(
             routing_temperature=routing_temperature,
             routing_logit_scale=routing_logit_scale,
+        )
+        self.student_router = (
+            EmbeddingStudentRouter(
+                encoder_names=self.encoder_names,
+                feature_dim=target_dim,
+                hidden_dim=student_router_hidden_dim,
+                temperature=student_router_temperature,
+            )
+            if student_router_hidden_dim > 0
+            else None
         )
         self.classifier = ABMIL_Cls(
             D_feat=target_dim,
@@ -107,6 +119,11 @@ class GMEModel(nn.Module):
             attribution_scores=attribution_scores,
             encoder_names=self.encoder_names,
         )
+
+    def route_with_student(self, projected: Mapping[str, torch.Tensor]):
+        if self.student_router is None:
+            raise RuntimeError("Student routing was requested but no student_router is configured.")
+        return self.student_router(projected)
 
     def beacon_constraint_loss(
         self,
@@ -163,6 +180,7 @@ class GMEModel(nn.Module):
         gaussian_std_scale: float = 1.0,
         compute_interactions: bool = True,
         interaction_target_class: int | None = None,
+        target_class: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return attribution routing scores and optional signed interactions.
 
@@ -181,9 +199,13 @@ class GMEModel(nn.Module):
             with torch.no_grad():
                 full_logits, _ = self.forward_mean_fusion(projected)
                 attribution_target_class = (
-                    1
-                    if self.attribution_target == "class_1"
-                    else int(full_logits.argmax(dim=1)[0].item())
+                    int(target_class)
+                    if target_class is not None
+                    else (
+                        1
+                        if self.attribution_target == "class_1"
+                        else int(full_logits.argmax(dim=1)[0].item())
+                    )
                 )
                 coalition_cache: Dict[frozenset[str], torch.Tensor] = {
                     frozenset(): full_logits
@@ -353,8 +375,25 @@ class GMEModel(nn.Module):
         gaussian_std_scale: float = 1.0,
         compute_interactions: bool = True,
         return_attribution_logits: bool = False,
+        use_student_router: bool = False,
     ):
         projected = self.project(raw_features)
+        if use_student_router:
+            routed = self.route_with_student(projected)
+            logits, attn = self.classifier(routed.fused)
+            zeros = logits.new_zeros(len(self.encoder_names))
+            return (
+                logits,
+                attn,
+                routed,
+                projected,
+                routed.combined_scores,
+                zeros,
+                logits.new_zeros((len(self.encoder_names), len(self.encoder_names))),
+                logits.detach(),
+                torch.zeros_like(routed.fused),
+                logits.new_zeros(len(self.interaction_pairs)),
+            )
         attr, single_attr, interactions = self.intervention_attribution(
             projected=projected,
             baselines=baselines,

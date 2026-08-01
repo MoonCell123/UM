@@ -18,6 +18,7 @@ while attribution needs a routed model prediction.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import random
@@ -587,6 +588,176 @@ def next_stage2_beacon_weight(
     return max(0.0, min(current, initial, ratio_cap))
 
 
+def train_mean_teacher_epoch(
+    model: GMEModel,
+    dataset,
+    optimizer,
+    device: torch.device,
+    grad_clip: float,
+) -> float:
+    """Train the attribution teacher with uniform mean fusion only."""
+    model.train()
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    for idx in np.random.permutation(len(dataset)):
+        raw_features, label, _ = dataset[int(idx)]
+        raw_features = move_features(raw_features, device)
+        label_t = torch.tensor([label], dtype=torch.long, device=device)
+        optimizer.zero_grad(set_to_none=True)
+        projected = model.project(raw_features)
+        logits, _ = model.forward_mean_fusion(projected)
+        loss = criterion(logits, label_t)
+        loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        optimizer.step()
+        total_loss += float(loss.detach().cpu())
+    return total_loss / max(len(dataset), 1)
+
+
+@torch.no_grad()
+def evaluate_mean_teacher(
+    model: GMEModel,
+    dataset,
+    device: torch.device,
+    decision_threshold: float,
+) -> EvalResult:
+    model.eval()
+    labels: List[int] = []
+    probabilities: List[float] = []
+    for idx in range(len(dataset)):
+        raw_features, label, _ = dataset[idx]
+        raw_features = move_features(raw_features, device)
+        logits, _ = model.forward_mean_fusion(model.project(raw_features))
+        labels.append(int(label))
+        probabilities.append(float(torch.softmax(logits, dim=1)[0, 1].cpu()))
+    return compute_metrics(labels, probabilities, decision_threshold)
+
+
+@torch.no_grad()
+def build_teacher_attribution_targets(
+    teacher: GMEModel,
+    dataset,
+    device: torch.device,
+    baselines: Mapping[str, Mapping[str, torch.Tensor]],
+    replacement_strategy: str,
+    gaussian_std_scale: float,
+    temperature: float,
+    clip: float,
+) -> Tuple[Dict[str, torch.Tensor], pd.DataFrame]:
+    """Build train-only soft router targets from true-label teacher LOO margins."""
+    teacher.eval()
+    targets: Dict[str, torch.Tensor] = {}
+    rows: List[Dict[str, object]] = []
+    for idx in range(len(dataset)):
+        raw_features, label, slide_id = dataset[idx]
+        raw_features = move_features(raw_features, device)
+        projected = teacher.project(raw_features)
+        scores, _, _ = teacher.intervention_attribution(
+            projected=projected,
+            baselines=baselines,
+            replacement_strategy=replacement_strategy,
+            gaussian_std_scale=gaussian_std_scale,
+            compute_interactions=False,
+            target_class=int(label),
+        )
+        centered = scores - scores.mean()
+        normalized = centered / centered.std(unbiased=False).clamp_min(1e-8)
+        normalized = normalized.clamp(min=-float(clip), max=float(clip))
+        weights = torch.softmax(normalized / float(temperature), dim=-1)
+        targets[str(slide_id)] = weights.detach().cpu()
+        for name, raw_score, normalized_score, weight in zip(
+            teacher.encoder_names, scores, normalized, weights
+        ):
+            rows.append({
+                "slide_id": str(slide_id),
+                "label": int(label),
+                "encoder": name,
+                "loo_true_margin": float(raw_score.cpu()),
+                "normalized_score": float(normalized_score.cpu()),
+                "teacher_weight": float(weight.cpu()),
+            })
+    return targets, pd.DataFrame(rows)
+
+
+def train_teacher_student_epoch(
+    model: GMEModel,
+    dataset,
+    optimizer,
+    device: torch.device,
+    baselines: Mapping[str, Mapping[str, torch.Tensor]],
+    beacon: torch.Tensor,
+    beacon_constraint_weight: float,
+    teacher_targets: Mapping[str, torch.Tensor],
+    distill_weight: float,
+    grad_clip: float,
+    weight_averager: ExponentialMovingAverage | None = None,
+) -> Tuple[float, float, float, float]:
+    """Train a label-free student router against cached teacher soft targets."""
+    projection_is_trainable = any(param.requires_grad for param in model.projection_heads.parameters())
+    model.train()
+    if not projection_is_trainable:
+        model.projection_heads.eval()
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    total_cls_loss = 0.0
+    total_beacon_loss = 0.0
+    total_distill_loss = 0.0
+
+    for idx in np.random.permutation(len(dataset)):
+        raw_features, label, slide_id = dataset[int(idx)]
+        slide_id = str(slide_id)
+        if slide_id not in teacher_targets:
+            raise KeyError(f"Missing teacher attribution target for slide {slide_id}")
+        raw_features = move_features(raw_features, device)
+        label_t = torch.tensor([label], dtype=torch.long, device=device)
+        target_weights = teacher_targets[slide_id].to(device=device)
+
+        optimizer.zero_grad(set_to_none=True)
+        (
+            logits, _attn, routed, projected, _scores, _single, _interactions,
+            _base_logits, _pair_residual, _scaled,
+        ) = model.forward_stage2(
+            raw_features=raw_features,
+            baselines=baselines,
+            compute_interactions=False,
+            use_student_router=True,
+        )
+        cls_loss = criterion(logits, label_t)
+        distill_loss = F.kl_div(
+            routed.weights.clamp_min(1e-8).log(),
+            target_weights,
+            reduction="sum",
+        )
+        if beacon_constraint_weight > 0 and projection_is_trainable:
+            beacon_loss, _ = model.beacon_constraint_loss(projected=projected, beacon=beacon)
+        else:
+            beacon_loss = cls_loss.new_tensor(0.0)
+        loss = (
+            cls_loss
+            + float(beacon_constraint_weight) * beacon_loss
+            + float(distill_weight) * distill_loss
+        )
+        loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        optimizer.step()
+        if weight_averager is not None:
+            weight_averager.update(model)
+        total_loss += float(loss.detach().cpu())
+        total_cls_loss += float(cls_loss.detach().cpu())
+        total_beacon_loss += float(beacon_loss.detach().cpu())
+        total_distill_loss += float(distill_loss.detach().cpu())
+
+    denom = max(len(dataset), 1)
+    return (
+        total_loss / denom,
+        total_cls_loss / denom,
+        total_beacon_loss / denom,
+        total_distill_loss / denom,
+    )
+
+
 def train_stage2_epoch(
     model: GMEModel,
     dataset: MultiEncoderSlideDataset,
@@ -665,6 +836,7 @@ def evaluate_stage2(
     gaussian_std_scale: float,
     decision_threshold: float,
     fused_output_dir: Path | None = None,
+    use_student_router: bool = False,
 ) -> Tuple[EvalResult, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     model.eval()
     labels, probs, rows, weight_rows, interaction_rows = [], [], [], [], []
@@ -691,6 +863,7 @@ def evaluate_stage2(
             replacement_strategy=replacement_strategy,
             gaussian_std_scale=gaussian_std_scale,
             return_attribution_logits=True,
+            use_student_router=use_student_router,
         )
         beacon_sims: Dict[str, torch.Tensor] = {}
         if beacon is not None:
@@ -904,6 +1077,7 @@ def run_fold(
 ) -> Mapping[str, object]:
     fold_dir = output_dir / f"fold_{fold}"
     fold_dir.mkdir(parents=True, exist_ok=True)
+    use_teacher_student = args.routing_mode == "teacher_student"
 
     train_ds = MultiEncoderSlideDataset(
         manifest=manifest,
@@ -967,6 +1141,12 @@ def run_fold(
         attribution_target=args.attribution_target,
         interaction_pair_beta=args.interaction_pair_beta,
         interaction_rms_clip=args.interaction_rms_clip,
+        student_router_hidden_dim=(
+            args.student_router_hidden_dim
+            if args.routing_mode == "teacher_student"
+            else 0
+        ),
+        student_router_temperature=args.student_router_temperature,
     ).to(device)
 
     print(f"\nFold {fold}: train={len(train_ds)}, val={len(val_ds)}, encoders={train_ds.encoder_names}")
@@ -1120,7 +1300,127 @@ def run_fold(
         if stage1_path.exists():
             load_model_state(stage1_path, model, device)
 
-    if args.freeze_projection_stage2:
+    teacher_targets: Dict[str, torch.Tensor] | None = None
+    if use_teacher_student:
+        teacher = copy.deepcopy(model).to(device)
+        set_projection_trainable(teacher, True)
+        teacher_optimizer = torch.optim.AdamW(
+            [parameter for parameter in teacher.parameters() if parameter.requires_grad],
+            lr=args.teacher_lr,
+            weight_decay=args.weight_decay,
+        )
+        teacher_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            teacher_optimizer,
+            T_max=max(args.teacher_epochs, 1),
+            eta_min=args.teacher_lr * 0.01,
+        )
+        teacher_best_path = fold_dir / "best_attribution_teacher.pt"
+        teacher_best_auc = -math.inf
+        teacher_no_improve = 0
+        teacher_history: List[Dict[str, object]] = []
+        print(
+            f"Fold {fold} | Frozen-attribution teacher pretrain | "
+            f"mean fusion | epochs={args.teacher_epochs}"
+        )
+        for teacher_epoch in range(1, args.teacher_epochs + 1):
+            teacher_loss = train_mean_teacher_epoch(
+                teacher,
+                inner_train_ds,
+                teacher_optimizer,
+                device,
+                args.grad_clip,
+            )
+            teacher_metrics = evaluate_mean_teacher(
+                teacher,
+                inner_val_ds,
+                device,
+                args.threshold,
+            )
+            teacher_scheduler.step()
+            teacher_history.append({
+                "epoch": int(teacher_epoch),
+                "train_loss": float(teacher_loss),
+                "inner_auc": float(teacher_metrics.auc),
+                "inner_auprc": float(teacher_metrics.auprc),
+                "inner_f1": float(teacher_metrics.f1),
+            })
+            pd.DataFrame(teacher_history).to_csv(
+                fold_dir / "teacher_training_history.csv",
+                index=False,
+                encoding="utf-8-sig",
+                float_format="%.6f",
+            )
+            print(
+                f"Fold {fold} | Teacher | Epoch {teacher_epoch:03d}/{args.teacher_epochs} | "
+                f"loss={teacher_loss:.4f} | inner_AUC={teacher_metrics.auc:.4f} | "
+                f"inner_AUPRC={teacher_metrics.auprc:.4f}"
+            )
+            if not np.isnan(teacher_metrics.auc) and teacher_metrics.auc > teacher_best_auc:
+                teacher_best_auc = teacher_metrics.auc
+                teacher_no_improve = 0
+                torch.save({
+                    "epoch": int(teacher_epoch),
+                    "state_dict": teacher.state_dict(),
+                    "metrics": asdict(teacher_metrics),
+                    "stage": "frozen_mean_fusion_attribution_teacher",
+                }, teacher_best_path)
+            else:
+                teacher_no_improve += 1
+                if teacher_no_improve >= args.teacher_patience:
+                    break
+        if not teacher_best_path.exists():
+            raise RuntimeError(f"Fold {fold}: no attribution teacher checkpoint was selected.")
+        teacher_payload = torch.load(teacher_best_path, map_location=device)
+        teacher.load_state_dict(teacher_payload["state_dict"])
+        teacher.eval()
+        for parameter in teacher.parameters():
+            parameter.requires_grad_(False)
+
+        _, _, teacher_baselines, teacher_baseline_summary = build_beacon_and_baselines(
+            teacher,
+            inner_baseline_ds,
+            device,
+            args.target_dim,
+        )
+        teacher_targets, teacher_target_rows = build_teacher_attribution_targets(
+            teacher=teacher,
+            dataset=inner_score_stats_ds,
+            device=device,
+            baselines=teacher_baselines,
+            replacement_strategy=args.replacement_strategy,
+            gaussian_std_scale=args.gaussian_std_scale,
+            temperature=args.teacher_target_temperature,
+            clip=args.teacher_target_clip,
+        )
+        teacher_target_rows.to_csv(
+            fold_dir / "teacher_attribution_targets.csv",
+            index=False,
+            encoding="utf-8-sig",
+            float_format="%.6f",
+        )
+        teacher_baseline_summary.to_csv(
+            fold_dir / "teacher_replacement_baseline_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        torch.save({
+            "targets": teacher_targets,
+            "encoder_names": teacher.encoder_names,
+            "teacher_checkpoint": str(teacher_best_path),
+            "target_temperature": float(args.teacher_target_temperature),
+            "target_clip": float(args.teacher_target_clip),
+            "target": "true_label_logit_margin_loo",
+        }, fold_dir / "teacher_attribution_targets.pt")
+
+        # Warm-start the student representation and classifier from the frozen
+        # teacher; the embedding router itself remains label-free at inference.
+        model.load_state_dict(teacher.state_dict())
+        set_projection_trainable(model, not bool(args.teacher_freeze_projection))
+        stage2_beacon_weight = (
+            0.0 if args.teacher_freeze_projection else float(args.beacon_constraint_weight)
+        )
+        del teacher
+    elif args.freeze_projection_stage2:
         set_projection_trainable(model, False)
         if args.stage2_warm_start_classifier:
             print("[Warning] Stage1 is projection-only, so there is no pretrained classifier to warm-start.")
@@ -1183,19 +1483,37 @@ def run_fold(
         if ema is not None and not ema.initialized and epoch >= args.ema_start_epoch:
             ema.initialize(model)
         epoch_beacon_weight = float(current_stage2_beacon_weight)
-        train_loss, train_cls_loss, train_beacon_loss = train_stage2_epoch(
-            model=model,
-            dataset=inner_train_ds,
-            optimizer=optimizer2,
-            device=device,
-            baselines=baselines,
-            beacon=beacon,
-            beacon_constraint_weight=epoch_beacon_weight,
-            replacement_strategy=args.replacement_strategy,
-            gaussian_std_scale=args.gaussian_std_scale,
-            grad_clip=args.grad_clip,
-            weight_averager=ema if ema is not None and ema.initialized else None,
-        )
+        if use_teacher_student:
+            if teacher_targets is None:
+                raise RuntimeError("Teacher targets were not initialized.")
+            train_loss, train_cls_loss, train_beacon_loss, train_distill_loss = train_teacher_student_epoch(
+                model=model,
+                dataset=inner_train_ds,
+                optimizer=optimizer2,
+                device=device,
+                baselines=baselines,
+                beacon=beacon,
+                beacon_constraint_weight=epoch_beacon_weight,
+                teacher_targets=teacher_targets,
+                distill_weight=args.teacher_distill_weight,
+                grad_clip=args.grad_clip,
+                weight_averager=ema if ema is not None and ema.initialized else None,
+            )
+        else:
+            train_loss, train_cls_loss, train_beacon_loss = train_stage2_epoch(
+                model=model,
+                dataset=inner_train_ds,
+                optimizer=optimizer2,
+                device=device,
+                baselines=baselines,
+                beacon=beacon,
+                beacon_constraint_weight=epoch_beacon_weight,
+                replacement_strategy=args.replacement_strategy,
+                gaussian_std_scale=args.gaussian_std_scale,
+                grad_clip=args.grad_clip,
+                weight_averager=ema if ema is not None and ema.initialized else None,
+            )
+            train_distill_loss = float("nan")
         next_beacon_weight = next_stage2_beacon_weight(
             current_weight=epoch_beacon_weight,
             initial_weight=stage2_beacon_weight,
@@ -1257,6 +1575,7 @@ def run_fold(
                 replacement_strategy=args.replacement_strategy,
                 gaussian_std_scale=args.gaussian_std_scale,
                 decision_threshold=args.threshold,
+                use_student_router=use_teacher_student,
             )
             base_val_metrics = compute_metrics(
                 val_pred["label"],
@@ -1272,6 +1591,7 @@ def run_fold(
                 "train_loss": float(train_loss),
                 "train_cls_loss": float(train_cls_loss),
                 "train_beacon_loss": float(train_beacon_loss),
+                "train_distill_loss": float(train_distill_loss),
                 "beacon_weight": float(epoch_beacon_weight),
                 "weighted_beacon_loss": float(epoch_beacon_weight * train_beacon_loss),
                 "next_beacon_weight": float(next_beacon_weight),
@@ -1293,7 +1613,8 @@ def run_fold(
             )
             print(
                 f"Fold {fold} | Epoch {epoch:03d}/{args.stage2_epochs} | "
-                f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | beacon={train_beacon_loss:.4f} | "
+                f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | "
+                f"distill={train_distill_loss:.4f} | beacon={train_beacon_loss:.4f} | "
                 f"inner_AUC={val_metrics.auc:.4f} | inner_AUPRC={val_metrics.auprc:.4f} | "
                 f"attr_AUC={base_val_metrics.auc:.4f} | "
                 f"ACC@{args.threshold:g}={val_metrics.accuracy:.4f} | F1@{args.threshold:g}={val_metrics.f1:.4f} | "
@@ -1578,6 +1899,7 @@ def run_fold(
         gaussian_std_scale=args.gaussian_std_scale,
         decision_threshold=decision_threshold,
         fused_output_dir=fused_dir,
+        use_student_router=use_teacher_student,
     )
     efficiency = profile_gme_efficiency(
         model=model,
@@ -1589,6 +1911,7 @@ def run_fold(
         profile_samples=args.profile_samples,
         profile_warmup=args.profile_warmup,
         profile_repeat=args.profile_repeat,
+        use_student_router=use_teacher_student,
     )
     save_fold_outputs(
         fold_dir, "final", final_metrics, final_pred, final_weights,

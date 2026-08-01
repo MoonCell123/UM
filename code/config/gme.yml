@@ -62,6 +62,18 @@ beacon_constraint_weight: 0.05
 adaptive_beacon_weight: false
 beacon_loss_ratio: 1.0
 
+routing_mode: "teacher_student"  # online_attribution or teacher_student
+# teacher_student uses true-label LOO only to create frozen train-only targets.
+teacher_epochs: 20
+teacher_patience: 5
+teacher_lr: 0.0001
+teacher_distill_weight: 0.5
+teacher_target_temperature: 1.0
+teacher_target_clip: 3.0
+student_router_hidden_dim: 64
+student_router_temperature: 1.0
+teacher_freeze_projection: true
+
 max_patches: 0
 eval_max_patches: 0
 baseline_max_patches: 0

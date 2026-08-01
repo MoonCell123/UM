@@ -239,6 +239,56 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Scale applied to normalized attribution before softmax routing.",
     )
+    parser.add_argument(
+        "--routing-mode",
+        choices=["online_attribution", "teacher_student"],
+        default="online_attribution",
+        help="Use existing online attribution routing or frozen-teacher router distillation.",
+    )
+    parser.add_argument(
+        "--teacher-epochs",
+        type=int,
+        default=20,
+        help="Maximum mean-fusion teacher epochs when --routing-mode=teacher_student.",
+    )
+    parser.add_argument("--teacher-patience", type=int, default=5)
+    parser.add_argument("--teacher-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--teacher-distill-weight",
+        type=float,
+        default=0.5,
+        help="KL loss weight matching student router weights to frozen teacher attribution.",
+    )
+    parser.add_argument(
+        "--teacher-target-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature converting normalized true-label LOO scores into teacher router targets.",
+    )
+    parser.add_argument(
+        "--teacher-target-clip",
+        type=float,
+        default=3.0,
+        help="Symmetric clip applied after per-slide teacher attribution z-scoring.",
+    )
+    parser.add_argument(
+        "--student-router-hidden-dim",
+        type=int,
+        default=64,
+        help="Hidden width of the embedding-only student router.",
+    )
+    parser.add_argument(
+        "--student-router-temperature",
+        type=float,
+        default=1.0,
+        help="Softmax temperature used by the embedding-only student router.",
+    )
+    parser.add_argument(
+        "--teacher-freeze-projection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep student projections fixed to the teacher feature space during distillation.",
+    )
 
     parser.add_argument(
         "--max-patches",
@@ -288,6 +338,32 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--beacon-constraint-weight must be non-negative.")
     if float(args.beacon_loss_ratio) <= 0.0:
         raise ValueError("--beacon-loss-ratio must be positive.")
+    if int(args.teacher_epochs) < 1:
+        raise ValueError("--teacher-epochs must be at least 1.")
+    if int(args.teacher_patience) < 1:
+        raise ValueError("--teacher-patience must be at least 1.")
+    if float(args.teacher_lr) <= 0.0:
+        raise ValueError("--teacher-lr must be positive.")
+    if float(args.teacher_distill_weight) < 0.0:
+        raise ValueError("--teacher-distill-weight must be non-negative.")
+    if float(args.teacher_target_temperature) <= 0.0:
+        raise ValueError("--teacher-target-temperature must be positive.")
+    if float(args.teacher_target_clip) <= 0.0:
+        raise ValueError("--teacher-target-clip must be positive.")
+    if int(args.student_router_hidden_dim) < 1:
+        raise ValueError("--student-router-hidden-dim must be at least 1.")
+    if float(args.student_router_temperature) <= 0.0:
+        raise ValueError("--student-router-temperature must be positive.")
+    if args.routing_mode == "teacher_student" and args.training_protocol != "fixed_split_no_refit":
+        raise ValueError(
+            "--routing-mode=teacher_student currently requires "
+            "--training-protocol=fixed_split_no_refit so teacher targets remain train-only."
+        )
+    if args.routing_mode == "teacher_student" and float(args.interaction_pair_beta) != 0.0:
+        raise ValueError(
+            "--routing-mode=teacher_student currently requires --interaction-pair-beta=0. "
+            "The student router path does not use online interaction residuals."
+        )
     if not 0.0 < float(args.ema_decay) < 1.0:
         raise ValueError("--ema-decay must be between 0 and 1.")
     if int(args.ema_start_epoch) < 1:
