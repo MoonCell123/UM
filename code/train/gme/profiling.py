@@ -25,12 +25,23 @@ class GMEProfileWrapper(nn.Module):
         self,
         model: GMEModel,
         encoder_names: Sequence[str],
+        use_student_router: bool = False,
     ):
         super().__init__()
         self.model = model
         self.encoder_names = list(encoder_names)
+        self.use_student_router = bool(use_student_router)
 
     def forward(self, *feature_tensors: torch.Tensor) -> torch.Tensor:
+        if self.use_student_router:
+            raw_features = {
+                name: tensor
+                for name, tensor in zip(self.encoder_names, feature_tensors)
+            }
+            projected = self.model.project(raw_features)
+            routed = self.model.route_with_student(projected)
+            logits, _ = self.model.classifier(routed.fused)
+            return logits
         attribution_scores = feature_tensors[-2]
         interaction_vector = feature_tensors[-1]
         raw_features = {
@@ -164,6 +175,7 @@ def profile_gme_efficiency(
     profile_samples: int,
     profile_warmup: int,
     profile_repeat: int,
+    use_student_router: bool = False,
 ) -> Dict[str, float]:
     parameters = count_parameters(model)
     raw_samples = collect_profile_inputs(dataset, device, profile_samples)
@@ -176,30 +188,35 @@ def profile_gme_efficiency(
     with torch.no_grad():
         offline_scores = []
         offline_interactions = []
-        for raw_features in raw_samples:
-            projected = model.project(raw_features)
-            routing_scores, _, _ = model.intervention_attribution(
-                projected=projected,
-                baselines=baselines,
-                replacement_strategy=replacement_strategy,
-                gaussian_std_scale=gaussian_std_scale,
-                compute_interactions=False,
-            )
-            _, _, interactions = model.intervention_attribution(
-                projected=projected,
-                baselines=baselines,
-                replacement_strategy=replacement_strategy,
-                gaussian_std_scale=gaussian_std_scale,
-                compute_interactions=True,
-                interaction_target_class=1,
-            )
-            offline_scores.append(routing_scores.detach())
-            offline_interactions.append(model.flatten_interactions(interactions).detach())
+        if not use_student_router:
+            for raw_features in raw_samples:
+                projected = model.project(raw_features)
+                routing_scores, _, _ = model.intervention_attribution(
+                    projected=projected,
+                    baselines=baselines,
+                    replacement_strategy=replacement_strategy,
+                    gaussian_std_scale=gaussian_std_scale,
+                    compute_interactions=False,
+                )
+                _, _, interactions = model.intervention_attribution(
+                    projected=projected,
+                    baselines=baselines,
+                    replacement_strategy=replacement_strategy,
+                    gaussian_std_scale=gaussian_std_scale,
+                    compute_interactions=True,
+                    interaction_target_class=1,
+                )
+                offline_scores.append(routing_scores.detach())
+                offline_interactions.append(model.flatten_interactions(interactions).detach())
     model.train(was_training)
-    profile_inputs = profile_sample_tuples(
-        raw_samples, model.encoder_names, offline_scores, offline_interactions
+    profile_inputs = (
+        profile_sample_tuples(raw_samples, model.encoder_names)
+        if use_student_router
+        else profile_sample_tuples(raw_samples, model.encoder_names, offline_scores, offline_interactions)
     )
-    wrapper = GMEProfileWrapper(model, model.encoder_names).to(device)
+    wrapper = GMEProfileWrapper(
+        model, model.encoder_names, use_student_router=use_student_router
+    ).to(device)
     flops = estimate_fvcore_flops(wrapper, profile_inputs)
     inference_time = measure_forward_time_seconds(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
     return {

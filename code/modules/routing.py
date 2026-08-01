@@ -235,3 +235,70 @@ class DualConsistencyRouter(nn.Module):
             tau=tau,
             encoder_names=names,
         )
+
+
+class EmbeddingStudentRouter(nn.Module):
+    """Predict encoder fusion weights directly from projected slide embeddings.
+
+    This router is intended to be supervised by frozen teacher-attribution
+    targets during training.  It never consumes labels or intervention scores
+    at inference time.
+    """
+
+    def __init__(
+        self,
+        encoder_names: Sequence[str],
+        feature_dim: int,
+        hidden_dim: int = 64,
+        temperature: float = 1.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if not encoder_names:
+            raise ValueError("EmbeddingStudentRouter requires at least one encoder.")
+        if feature_dim <= 0 or hidden_dim <= 0:
+            raise ValueError("feature_dim and hidden_dim must be positive.")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        self.encoder_names = list(encoder_names)
+        self.temperature = float(temperature)
+        self.score_net = nn.Sequential(
+            nn.LayerNorm(2 * int(feature_dim)),
+            nn.Linear(2 * int(feature_dim), int(hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), 1),
+        )
+        self.encoder_bias = nn.Parameter(torch.zeros(len(self.encoder_names)))
+
+    def _slide_means(self, features_by_encoder: TensorDict) -> torch.Tensor:
+        means = []
+        for name in self.encoder_names:
+            if name not in features_by_encoder:
+                raise KeyError(f"Missing encoder features: {name}")
+            features = features_by_encoder[name]
+            means.append(features.reshape(-1, features.shape[-1]).mean(dim=0))
+        return torch.stack(means, dim=0)
+
+    def forward(self, features_by_encoder: TensorDict) -> RoutingOutput:
+        means = self._slide_means(features_by_encoder)
+        consensus = means.mean(dim=0, keepdim=True).expand_as(means)
+        scores = self.score_net(torch.cat([means, consensus], dim=-1)).squeeze(-1)
+        scores = scores + self.encoder_bias
+        weights = torch.softmax(scores / self.temperature, dim=-1)
+        fused, adaptive_fused, names = dual_consistency_fusion(
+            features_by_encoder=features_by_encoder,
+            weights=weights,
+            encoder_names=self.encoder_names,
+        )
+        score_range = (scores.max() - scores.min()).unsqueeze(0)
+        return RoutingOutput(
+            fused=fused,
+            weights=weights,
+            adaptive_fused=adaptive_fused,
+            combined_scores=scores,
+            normalized_attribution=weights,
+            attribution_range=score_range,
+            tau=scores.new_tensor([self.temperature]),
+            encoder_names=names,
+        )
