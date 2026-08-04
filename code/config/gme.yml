@@ -20,7 +20,7 @@ folds: null
 training_protocol: "fixed_split_no_refit"  # nested_refit or fixed_split_no_refit; use folds: [1] to train once
 seed: 42
 device: "cuda"
-gpu_id: 1
+gpu_id: 0
 
 target_dim: 512
 projection_dropout: 0.1
@@ -32,7 +32,6 @@ n_classes: 2
 stage1_epochs: 0
 stage1_patience: 5
 lr_stage1: 0.0
-stage1_beacon_mode: "none"
 stage1_consistency_weight: 0.5
 stage1_max_patches: 1024
 stage1_eval_max_patches: 1024
@@ -54,20 +53,18 @@ threshold: 0.5
 replacement_strategy: "mean"    # embedding mask way
 gaussian_std_scale: 1.0
 attribution_target: "predicted_class"
+# del interaction param just for analysis
 interaction_pair_beta: 0.0
 interaction_pair_lr: 0.001
 interaction_pair_weight_decay: 0.01
 interaction_rms_clip: 3.0
-beacon_constraint_weight: 0.05
-adaptive_beacon_weight: false
-beacon_loss_ratio: 1.0
 
 routing_mode: "teacher_student"  # online_attribution or teacher_student
-# teacher_student uses true-label LOO only to create frozen train-only targets.
 teacher_epochs: 20
 teacher_patience: 5
 teacher_lr: 0.0001
-teacher_distill_weight: 0.5
+teacher_distill_weight: 0.0       # Keep KL off
+teacher_kl_loss_ratio: 0.0       # Maximum weighted KL / CE loss per sample; 0 disables the cap; 0.1
 teacher_target_temperature: 1.0
 teacher_target_clip: 3.0
 student_router_hidden_dim: 64

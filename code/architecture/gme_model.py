@@ -125,36 +125,6 @@ class GMEModel(nn.Module):
             raise RuntimeError("Student routing was requested but no student_router is configured.")
         return self.student_router(projected)
 
-    def beacon_constraint_loss(
-        self,
-        projected: Mapping[str, torch.Tensor],
-        beacon: torch.Tensor,
-        eps: float = 1e-8,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Constrain encoder-level slide means toward a detached global Beacon.
-
-        Beacon is used only as a structural/global semantic prior here. It does
-        not enter routing weights or classifier features.
-        """
-        first = next(iter(projected.values()))
-        beacon = beacon.to(device=first.device, dtype=first.dtype).reshape(-1)
-        if beacon.shape[0] != self.target_dim:
-            raise ValueError(f"Expected beacon dim={self.target_dim}, got {beacon.shape[0]}")
-        beacon = beacon / beacon.norm(p=2).clamp_min(eps)
-
-        losses = []
-        similarities: Dict[str, torch.Tensor] = {}
-        for name in self.encoder_names:
-            h = projected[name].reshape(-1, projected[name].shape[-1])
-            h = h / h.norm(p=2, dim=-1, keepdim=True).clamp_min(eps)
-            slide_mean = h.mean(dim=0)
-            slide_mean = slide_mean / slide_mean.norm(p=2).clamp_min(eps)
-            sim = torch.sum(slide_mean * beacon)
-            losses.append(1.0 - sim)
-            similarities[name] = sim.detach()
-
-        return torch.stack(losses, dim=0).mean(), similarities
-
     def encoder_consistency_loss(
         self,
         projected: Mapping[str, torch.Tensor],
