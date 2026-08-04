@@ -6,8 +6,9 @@ Baselines implemented here:
 2. mean            : per-encoder ProjectionHead -> mean over encoders -> ABMIL.
 3. concat          : per-encoder ProjectionHead -> concat -> linear reduction -> ABMIL.
 4. gated           : WSI-level learned encoder gates -> weighted sum -> ABMIL.
-5. cross_attention : per-encoder ProjectionHead -> encoder-token cross attention -> ABMIL.
-6. self_attention  : per-encoder ProjectionHead -> encoder-token self attention -> ABMIL.
+5. static_global_weight: train-set learned global encoder weights shared by every WSI -> ABMIL.
+6. cross_attention : per-encoder ProjectionHead -> encoder-token cross attention -> ABMIL.
+7. self_attention  : per-encoder ProjectionHead -> encoder-token self attention -> ABMIL.
 
 These are conventional baselines for comparing against train_gme.py. They do
 not use Beacon, intervention attribution, or GME routing.
@@ -65,7 +66,7 @@ DEFAULT_FEATURE_DIRS = [
     "features_hoptimus0",
 ]
 FEATURE_KEYS = ("feats", "features")
-METHODS = ("mean", "concat", "gated", "cross_attention", "self_attention")
+METHODS = ("mean", "concat", "gated", "static_global_weight", "cross_attention", "self_attention")
 PATH_ARGS = ("manifest", "manifest_dir", "output_dir", "run_dir")
 
 
@@ -528,6 +529,31 @@ class GatedFusion(nn.Module):
         return fused, weights
 
 
+class StaticGlobalWeightFusion(nn.Module):
+    """Learn one encoder-weight vector shared by every slide and patch."""
+
+    def __init__(self, num_encoders: int):
+        super().__init__()
+        if num_encoders < 1:
+            raise ValueError("StaticGlobalWeightFusion requires at least one encoder.")
+        # Equal-weight initialization makes this baseline start from mean fusion.
+        self.logits = nn.Parameter(torch.zeros(num_encoders))
+
+    def forward(self, embeddings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if embeddings.ndim != 3:
+            raise ValueError(
+                "StaticGlobalWeightFusion expects [N_patches, M_encoders, D], "
+                f"got {tuple(embeddings.shape)}"
+            )
+        if embeddings.shape[1] != self.logits.numel():
+            raise ValueError(
+                f"Expected {self.logits.numel()} encoders, got {embeddings.shape[1]}"
+            )
+        weights = torch.softmax(self.logits, dim=0)
+        fused = torch.sum(embeddings * weights.view(1, -1, 1), dim=1)
+        return fused, weights
+
+
 class SelfAttentionFusion(nn.Module):
     """Per-patch self-attention over encoder tokens followed by learned reduction."""
 
@@ -565,7 +591,7 @@ class ProjectedFusionABMIL(nn.Module):
 
     def __init__(self, method: str, input_dims: Mapping[str, int], args: argparse.Namespace):
         super().__init__()
-        if method not in {"mean", "concat", "gated", "cross_attention", "self_attention"}:
+        if method not in set(METHODS):
             raise ValueError(f"Unsupported projected fusion method: {method}")
         self.method = method
         self.encoder_names = sorted(input_dims.keys())
@@ -586,6 +612,11 @@ class ProjectedFusionABMIL(nn.Module):
         self.gated = (
             GatedFusion(dim=args.target_dim, pooling=args.gated_pooling)
             if method == "gated"
+            else None
+        )
+        self.static_global = (
+            StaticGlobalWeightFusion(len(self.encoder_names))
+            if method == "static_global_weight"
             else None
         )
 
@@ -628,11 +659,19 @@ class ProjectedFusionABMIL(nn.Module):
         if self.method == "gated":
             fused, _weights = self.gated(torch.stack(tensors, dim=1))
             return fused
+        if self.method == "static_global_weight":
+            fused, _weights = self.static_global(torch.stack(tensors, dim=1))
+            return fused
         if self.method == "cross_attention":
             return self.cross_attention(torch.stack(tensors, dim=1))
         if self.method == "self_attention":
             return self.self_attention(torch.stack(tensors, dim=1))
         raise RuntimeError(f"Unknown method: {self.method}")
+
+    def static_weights(self) -> torch.Tensor | None:
+        if self.static_global is None:
+            return None
+        return torch.softmax(self.static_global.logits.detach(), dim=0)
 
     def forward(self, raw_features: Mapping[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.classifier(self.fuse(raw_features))
@@ -1072,6 +1111,21 @@ def train_fold(
         profile_repeat=args.profile_repeat,
     )
     save_fold_outputs(fold_dir, model_name, final_metrics, final_pred, efficiency=efficiency)
+    static_weights = model.static_weights() if hasattr(model, "static_weights") else None
+    if static_weights is not None:
+        pd.DataFrame(
+            {
+                "fold": int(fold),
+                "encoder": encoder_names,
+                "weight": static_weights.detach().cpu().tolist(),
+                "scope": "train_fold_global_shared",
+            }
+        ).to_csv(
+            fold_dir / "static_global_weights.csv",
+            index=False,
+            encoding="utf-8-sig",
+            float_format="%.6f",
+        )
     if best_metrics is None:
         best_metrics = final_metrics
 
@@ -1193,11 +1247,6 @@ def main() -> None:
     print(f"Methods: {methods}")
     print(f"Folds: {folds}")
     print(f"Training protocol: {args.training_protocol}")
-    if args.training_protocol == "fixed_split_no_refit" and len(folds) > 1:
-        print(
-            "[Note] fixed_split_no_refit runs once per selected fold. "
-            "Set folds: [1] for a single fixed train/validation/test experiment."
-        )
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"CUDA device: {torch.cuda.current_device()} | {torch.cuda.get_device_name(device)}")

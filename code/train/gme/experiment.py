@@ -266,25 +266,17 @@ def set_projection_trainable(model: GMEModel, trainable: bool) -> None:
 
 
 def build_stage2_optimizer(model: GMEModel, args: argparse.Namespace) -> torch.optim.AdamW:
-    pair_parameters = [model.interaction_gate] if model.interaction_gate.requires_grad else []
-    pair_parameter_ids = {id(parameter) for parameter in pair_parameters}
     backbone_parameters = [
         parameter
         for parameter in model.parameters()
-        if parameter.requires_grad and id(parameter) not in pair_parameter_ids
+        if parameter.requires_grad
     ]
-    parameter_groups = []
-    if backbone_parameters:
-        parameter_groups.append({"params": backbone_parameters, "weight_decay": args.weight_decay})
-    if pair_parameters:
-        parameter_groups.append({
-            "params": pair_parameters,
-            "lr": args.interaction_pair_lr,
-            "weight_decay": args.interaction_pair_weight_decay,
-        })
-    if not parameter_groups:
+    if not backbone_parameters:
         raise RuntimeError("No trainable parameters left for Stage2.")
-    return torch.optim.AdamW(parameter_groups, lr=args.lr_stage2)
+    return torch.optim.AdamW(
+        [{"params": backbone_parameters, "weight_decay": args.weight_decay}],
+        lr=args.lr_stage2,
+    )
 
 
 def reset_stage2_classifier(model: GMEModel, args: argparse.Namespace, device: torch.device) -> None:
@@ -468,28 +460,28 @@ def update_train_offline_stats(
     replacement_strategy: str,
     gaussian_std_scale: float,
 ) -> Tuple[Dict[str, float], Dict[str, object]]:
-    """Estimate routing and per-pair interaction statistics from train only."""
+    """Estimate train-only routing statistics.
+
+    Pairwise interactions are intentionally not part of training statistics;
+    they are computed by the separate post-hoc analysis script.
+    """
     was_training = model.training
     model.eval()
 
     single_values = []
-    interaction_values = []
     for idx in range(len(dataset)):
         raw_features, _, _ = dataset[idx]
         raw_features = move_features(raw_features, device)
         projected = model.project(raw_features)
-        compute_interactions = model.interaction_pair_beta > 0.0
-        routing_scores, _single, interactions = model.intervention_attribution(
-                projected=projected,
-                baselines=baselines,
-                replacement_strategy=replacement_strategy,
-                gaussian_std_scale=gaussian_std_scale,
-                compute_interactions=compute_interactions,
-                interaction_target_class=1,
-            )
+        routing_scores, _single, _interactions = model.intervention_attribution(
+            projected=projected,
+            baselines=baselines,
+            replacement_strategy=replacement_strategy,
+            gaussian_std_scale=gaussian_std_scale,
+            compute_interactions=False,
+            interaction_target_class=1,
+        )
         single_values.append(routing_scores)
-        if compute_interactions:
-            interaction_values.append(model.flatten_interactions(interactions))
 
     score_min, score_max, score_count = _min_max_from_score_list(single_values)
     model.router.set_score_stats(
@@ -497,27 +489,13 @@ def update_train_offline_stats(
         attribution_max=score_max,
         count=score_count,
     )
-    if interaction_values:
-        interaction_tensor = torch.stack(interaction_values, dim=0).float()
-        interaction_mean = interaction_tensor.mean(dim=0)
-        interaction_std = interaction_tensor.std(dim=0, unbiased=False).clamp_min(1e-8)
-        interaction_rms = interaction_tensor.square().mean(dim=0).sqrt().clamp_min(1e-8)
-        model.set_interaction_stats(
-            mean=interaction_mean,
-            std=interaction_std,
-            rms=interaction_rms,
-            count=interaction_tensor.shape[0],
-        )
     interaction_stats: Dict[str, object] = {
-        "count": int(model.interaction_stats_count.detach().cpu().item()),
+        "count": 0,
         "pair_names": [
             f"{model.encoder_names[i]}__{model.encoder_names[j]}"
             for i, j in model.interaction_pairs
         ],
-        "mean": model.interaction_mean.detach().cpu().tolist(),
-        "std": model.interaction_std.detach().cpu().tolist(),
-        "rms": model.interaction_rms.detach().cpu().tolist(),
-        "scaling": "signed_rms_without_centering",
+        "analysis_only": True,
     }
     model.train(was_training)
     return model.router.get_score_stats(), interaction_stats
@@ -734,7 +712,7 @@ def train_stage2_epoch(
             baselines=baselines,
             replacement_strategy=replacement_strategy,
             gaussian_std_scale=gaussian_std_scale,
-            compute_interactions=True,
+            compute_interactions=False,
         )
         cls_loss = criterion(logits, label_t)
         loss = cls_loss
@@ -778,10 +756,10 @@ def evaluate_stage2(
             _projected,
             attr,
             single_attr,
-            interactions,
-            base_logits,
-            pair_residual,
-            scaled_interactions,
+            _interactions,
+            _base_logits,
+            _pair_residual,
+            _scaled_interactions,
         ) = model.forward_stage2(
             raw_features=raw_features,
             baselines=baselines,
@@ -791,28 +769,17 @@ def evaluate_stage2(
             use_student_router=use_student_router,
         )
         prob = float(torch.softmax(logits, dim=1)[0, 1].detach().cpu())
-        base_prob = float(torch.softmax(base_logits, dim=1)[0, 1].detach().cpu())
-        pair_rms = float(pair_residual.detach().float().square().mean().sqrt().cpu())
-        attribution_rms = float(routed.fused.detach().float().square().mean().sqrt().cpu())
-        pair_relative_rms = pair_rms / max(attribution_rms, 1e-8)
         labels.append(int(label))
         probs.append(prob)
         rows.append({
             "slide_id": slide_id,
             "label": int(label),
             "prob_class1": prob,
-            "base_prob_class1": base_prob,
-            "prob_delta": prob - base_prob,
-            "pair_residual_rms": pair_rms,
-            "attribution_fused_rms": attribution_rms,
-            "pair_relative_rms": pair_relative_rms,
         })
 
         weights = routed.weights.detach().cpu().reshape(-1).numpy()
         attr_np = attr.detach().cpu().reshape(-1).numpy()
         single_np = single_attr.detach().cpu().reshape(-1).numpy()
-        interaction_np = interactions.detach().cpu().numpy()
-        scaled_interaction_np = scaled_interactions.detach().cpu().reshape(-1).numpy()
         c_range = float(routed.attribution_range.detach().cpu().reshape(-1).item())
         tau = float(routed.tau.detach().cpu().reshape(-1).item())
         for encoder, weight, attr_value, single_value in zip(
@@ -829,19 +796,8 @@ def evaluate_stage2(
             if not use_student_router:
                 weight_row["attribution"] = float(single_value)
             weight_rows.append(weight_row)
-        for pair_index, (i, j) in enumerate(model.interaction_pairs):
-            left = routed.encoder_names[i]
-            right = routed.encoder_names[j]
-            interaction_rows.append({
-                "slide_id": slide_id,
-                "encoder_i": left,
-                "encoder_j": right,
-                "interaction": float(interaction_np[i, j]),
-                "scaled_interaction": float(scaled_interaction_np[pair_index]),
-            })
-
         if fused_output_dir is not None:
-            fused = (routed.fused + pair_residual).detach().cpu().numpy().astype(np.float32)
+            fused = routed.fused.detach().cpu().numpy().astype(np.float32)
             with h5py.File(fused_output_dir / f"{slide_id}.h5", "w") as f:
                 f.create_dataset("features", data=fused, compression="gzip")
 
@@ -1058,8 +1014,6 @@ def run_fold(
         routing_temperature=args.routing_temperature,
         routing_logit_scale=args.routing_logit_scale,
         attribution_target=args.attribution_target,
-        interaction_pair_beta=args.interaction_pair_beta,
-        interaction_rms_clip=args.interaction_rms_clip,
         student_router_hidden_dim=(
             args.student_router_hidden_dim
             if args.routing_mode == "teacher_student"
@@ -1440,13 +1394,6 @@ def run_fold(
                 decision_threshold=args.threshold,
                 use_student_router=use_teacher_student,
             )
-            base_val_metrics = compute_metrics(
-                val_pred["label"],
-                val_pred["base_prob_class1"],
-                decision_threshold=args.threshold,
-            )
-            mean_pair_relative_rms = float(val_pred["pair_relative_rms"].mean())
-            mean_abs_prob_delta = float(val_pred["prob_delta"].abs().mean())
             stage2_history.append({
                 "epoch": int(epoch),
                 "evaluation_weight_source": evaluation_weight_source,
@@ -1458,12 +1405,6 @@ def run_fold(
                 "inner_auc": float(val_metrics.auc),
                 "inner_auprc": float(val_metrics.auprc),
                 "inner_f1": float(val_metrics.f1),
-                "attribution_only_auc": float(base_val_metrics.auc),
-                "attribution_only_auprc": float(base_val_metrics.auprc),
-                "attribution_only_f1": float(base_val_metrics.f1),
-                "mean_pair_relative_rms": mean_pair_relative_rms,
-                "mean_abs_prob_delta": mean_abs_prob_delta,
-                "max_abs_prob_delta": float(val_pred["prob_delta"].abs().max()),
             })
             pd.DataFrame(stage2_history).to_csv(
                 fold_dir / "stage2_training_history.csv",
@@ -1496,9 +1437,6 @@ def run_fold(
                         "freeze_projection_stage2": bool(args.freeze_projection_stage2),
                         "stage1_path": str(stage1_path) if stage1_path.exists() else None,
                         "routing_score_stats": eval_score_stats,
-                        "interaction_stats": eval_interaction_stats,
-                        "interaction_pair_beta": float(args.interaction_pair_beta),
-                        "interaction_scaling": "signed_train_only_rms_without_centering",
                         "weight_averaging": args.weight_averaging,
                         "evaluation_weight_source": evaluation_weight_source,
                         "ema_decay": float(args.ema_decay),
@@ -1725,9 +1663,6 @@ def run_fold(
             "ema_decay": float(args.ema_decay),
             "ema_start_epoch": int(args.ema_start_epoch),
             "ema_num_updates": int(final_ema_num_updates),
-            "interaction_stats": final_interaction_stats,
-            "interaction_pair_beta": float(args.interaction_pair_beta),
-            "interaction_scaling": "signed_train_only_rms_without_centering",
         },
     )
 
@@ -1748,24 +1683,12 @@ def run_fold(
             f,
             indent=2,
         )
-    with open(fold_dir / "interaction_pair_branch.json", "w", encoding="utf-8") as f:
+    with open(fold_dir / "interaction_analysis.json", "w", encoding="utf-8") as f:
         json.dump(
             {
-                **final_interaction_stats,
-                "beta": float(args.interaction_pair_beta),
-                "rms_clip": float(args.interaction_rms_clip),
-                "normalization": "divide_by_train_only_pair_rms_without_centering",
-                "all_pairs_used": True,
-                "branch": "parameter_free_hadamard_pairs_with_feature_gate",
-                "gate_zero_initialized": True,
-                "gate_parameter_count": int(model.interaction_gate.numel()),
-                "gate_l2": float(model.interaction_gate.detach().float().norm().cpu()),
-                "gate_tanh_abs_mean": float(
-                    torch.tanh(model.interaction_gate.detach()).abs().mean().cpu()
-                ),
-                "gate_tanh_abs_max": float(
-                    torch.tanh(model.interaction_gate.detach()).abs().max().cpu()
-                ),
+                "analysis_only": True,
+                "script": "code/evaluation/compute_pairwise_interactions.py",
+                "note": "Pairwise interactions are not part of training or inference.",
             },
             f,
             indent=2,
@@ -1788,6 +1711,11 @@ def run_fold(
 
 def main() -> None:
     args = parse_args()
+    if args.workflow_mode != "fusion_only":
+        raise ValueError(
+            "train_gme.py is the fusion-only entry point. "
+            "Use code/train/run_gme_workflow.py for fusion_and_analysis or analysis_only."
+        )
     device = resolve_device(args)
     seed_everything(args.seed)
 
