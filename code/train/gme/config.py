@@ -100,12 +100,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-stage1", type=float, default=0.0)
     parser.add_argument("--stage1-patience", type=int, default=5)
     parser.add_argument(
-        "--stage1-beacon-mode",
-        choices=["none", "epoch"],
-        default="none",
-        help="Stage-1 Beacon loss policy. 'none' is fastest; 'epoch' rebuilds train Beacon each epoch.",
-    )
-    parser.add_argument(
         "--stage1-consistency-weight",
         type=float,
         default=0.5,
@@ -204,30 +198,6 @@ def parse_args() -> argparse.Namespace:
         help="Absolute clipping bound after train-only per-pair RMS scaling without centering.",
     )
     parser.add_argument(
-        "--beacon-constraint-weight",
-        type=float,
-        default=0.05,
-        help="Weight for the static Beacon global semantic prior constraint. 0 disables it.",
-    )
-    parser.add_argument(
-        "--adaptive-beacon-weight",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Adapt the Stage2 Beacon weight from train-only epoch losses so its weighted "
-            "contribution does not dominate classification."
-        ),
-    )
-    parser.add_argument(
-        "--beacon-loss-ratio",
-        type=float,
-        default=1.0,
-        help=(
-            "Maximum target ratio (weighted Beacon loss / classification loss) used by "
-            "adaptive Stage2 Beacon weighting."
-        ),
-    )
-    parser.add_argument(
         "--routing-temperature",
         type=float,
         default=0.5,
@@ -258,6 +228,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="KL loss weight matching student router weights to frozen teacher attribution.",
+    )
+    parser.add_argument(
+        "--teacher-kl-loss-ratio",
+        type=float,
+        default=0.1,
+        help=(
+            "Maximum weighted KL / classification-loss ratio per sample. "
+            "Set to 0 to disable the cap."
+        ),
     )
     parser.add_argument(
         "--teacher-target-temperature",
@@ -334,10 +313,6 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--interaction-pair-lr must be positive.")
     if float(args.interaction_rms_clip) <= 0.0:
         raise ValueError("--interaction-rms-clip must be positive.")
-    if float(args.beacon_constraint_weight) < 0.0:
-        raise ValueError("--beacon-constraint-weight must be non-negative.")
-    if float(args.beacon_loss_ratio) <= 0.0:
-        raise ValueError("--beacon-loss-ratio must be positive.")
     if int(args.teacher_epochs) < 1:
         raise ValueError("--teacher-epochs must be at least 1.")
     if int(args.teacher_patience) < 1:
@@ -346,6 +321,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--teacher-lr must be positive.")
     if float(args.teacher_distill_weight) < 0.0:
         raise ValueError("--teacher-distill-weight must be non-negative.")
+    if float(args.teacher_kl_loss_ratio) < 0.0:
+        raise ValueError("--teacher-kl-loss-ratio must be non-negative.")
     if float(args.teacher_target_temperature) <= 0.0:
         raise ValueError("--teacher-target-temperature must be positive.")
     if float(args.teacher_target_clip) <= 0.0:

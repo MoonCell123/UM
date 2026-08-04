@@ -402,12 +402,12 @@ PyYAML>=6.0
     重新初始化 Router + ABMIL
     freeze ProjectionHead
     ↓
-    train split -> projected embedding -> build static Beacon
+    train split -> projected embedding -> build replacement baselines
     ↓
     对每个 WSI:
       Projection
       ↓
-      Beacon similarity
+      replacement-based intervention scores
       ↓
       Intervention attribution
       ↓
