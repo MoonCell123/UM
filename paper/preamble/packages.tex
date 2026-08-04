@@ -2,8 +2,7 @@
 %              Packages                     %
 %========================================%
 
-% --- Page geometry ---
-\usepackage[top=1in, bottom=1in, left=1in, right=1in]{geometry}
+% Note: Do NOT load geometry — llncs.cls has its own fixed page layout.
 
 % --- Math ---
 \usepackage{amsmath}
@@ -27,10 +26,14 @@
 \usepackage{algpseudocode}
 
 % --- Bibliography ---
-\usepackage[authoryear,round,sort&compress]{natbib}
+% Note: LNCS uses splncs04.bst with standard BibTeX, not natbib.
 
 % --- Hyperlinks (load last, with exceptions) ---
+% Springer LNCS style: blue roman URLs
 \usepackage{hyperref}
+\usepackage{color}
+\renewcommand\UrlFont{\color{blue}\rmfamily}
+\urlstyle{rm}
 \hypersetup{
     colorlinks=true,
     linkcolor=blue,

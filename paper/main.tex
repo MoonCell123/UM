@@ -1,17 +1,21 @@
-%========================================%
-%            Main Document                 %
-%========================================%
-
-\documentclass[11pt]{article}
+\documentclass[runningheads]{llncs}
 
 % --- Preamble ---
 \input{preamble/packages}
 \input{preamble/macros}
 
 %========================================%
-\title{Adaptive Representation Fusion for Multiple Foundation Models via Contribution-Guided Gating}
-\author{Lun Fang \and Yang Liu \and Zijian Yang \and Meng Zhou}
-\date{}
+\title{Understanding and Integrating Multiple Pathology Foundation Model Representations}
+\titlerunning{Understanding and Integrating Multiple Pathology Foundation Models}
+
+\author{Lun Fang\inst{} \and
+Yang Liu\inst{} \and
+Zijian Yang\inst{} \and
+Meng Zhou\inst{*}}
+\authorrunning{L. Fang et al.}
+
+\institute{Wenzhou Medical University\\
+\email{\{fanglun, liuyang, yangzijian, zhoumeng\}@wmu.edu.cn}}
 
 \begin{document}
 \maketitle
@@ -23,11 +27,12 @@
 \input{chapters/introduction}
 \input{chapters/method}
 \input{chapters/experiment}
-\input{chapters/discussion}
 \input{chapters/conclusion}
 
-% --- Bibliography ---
-\bibliographystyle{plainnat}
+% ---- Bibliography ----
+% BibTeX users should specify bibliography style 'splncs04'.
+% References will then be sorted and formatted in the correct style.
+\bibliographystyle{splncs04}
 \bibliography{refs/refs}
 
 \end{document}
