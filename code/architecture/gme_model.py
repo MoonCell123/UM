@@ -1,4 +1,4 @@
-"""GME network, intervention attribution, and joint representation."""
+"""GME network and intervention attribution."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ from typing import Dict, Mapping, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from architecture.abmil_cls import ABMIL_Cls
 from architecture.projection_head import MultiEncoderProjectionHead
@@ -42,8 +41,6 @@ class GMEModel(nn.Module):
         routing_temperature: float = 0.5,
         routing_logit_scale: float = 1.0,
         attribution_target: str = "predicted_class",
-        interaction_pair_beta: float = 0.1,
-        interaction_rms_clip: float = 3.0,
         student_router_hidden_dim: int = 0,
         student_router_temperature: float = 1.0,
     ):
@@ -85,22 +82,13 @@ class GMEModel(nn.Module):
         if attribution_target == "class_1" and n_classes != 2:
             raise ValueError("attribution_target='class_1' requires binary classification.")
         self.attribution_target = attribution_target
-        if n_classes != 2:
-            raise ValueError("Interaction pairwise fusion currently requires binary classification.")
-        self.interaction_pair_beta = float(interaction_pair_beta)
-        self.interaction_rms_clip = float(interaction_rms_clip)
         self.interaction_pairs = [
             (i, j)
             for i in range(len(self.encoder_names))
             for j in range(i + 1, len(self.encoder_names))
         ]
-        # One learnable value per projected feature dimension. Zero
-        # initialization starts exactly at the attribution-only baseline.
-        self.interaction_gate = nn.Parameter(torch.zeros(self.target_dim))
-        self.register_buffer("interaction_mean", torch.zeros(len(self.interaction_pairs)))
-        self.register_buffer("interaction_std", torch.ones(len(self.interaction_pairs)))
-        self.register_buffer("interaction_rms", torch.ones(len(self.interaction_pairs)))
-        self.register_buffer("interaction_stats_count", torch.tensor(0, dtype=torch.long))
+        if n_classes != 2 and attribution_target == "class_1":
+            raise ValueError("attribution_target='class_1' requires binary classification.")
 
     def project(self, raw_features: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return self.projection_heads(raw_features)
@@ -148,7 +136,7 @@ class GMEModel(nn.Module):
         baselines: Mapping[str, Mapping[str, torch.Tensor]],
         replacement_strategy: str = "mean",
         gaussian_std_scale: float = 1.0,
-        compute_interactions: bool = True,
+        compute_interactions: bool = False,
         interaction_target_class: int | None = None,
         target_class: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -244,106 +232,13 @@ class GMEModel(nn.Module):
         """Flatten the signed upper triangle in deterministic encoder order."""
         return torch.stack([interactions[i, j] for i, j in self.interaction_pairs], dim=-1)
 
-    def set_interaction_stats(
-        self,
-        mean: torch.Tensor,
-        std: torch.Tensor,
-        rms: torch.Tensor,
-        count: int,
-    ) -> None:
-        expected = len(self.interaction_pairs)
-        if mean.numel() != expected or std.numel() != expected or rms.numel() != expected:
-            raise ValueError("Interaction statistics do not match the number of encoder pairs.")
-        self.interaction_mean.copy_(mean.to(self.interaction_mean).reshape_as(self.interaction_mean))
-        self.interaction_std.copy_(std.to(self.interaction_std).reshape_as(self.interaction_std).clamp_min(1e-8))
-        self.interaction_rms.copy_(rms.to(self.interaction_rms).reshape_as(self.interaction_rms).clamp_min(1e-8))
-        self.interaction_stats_count.copy_(
-            torch.as_tensor(int(count), device=self.interaction_stats_count.device)
-        )
-
-    def scale_interaction_vector(self, vector: torch.Tensor) -> torch.Tensor:
-        """Scale without centering so the original interaction sign is preserved."""
-        scaled = vector / self.interaction_rms.to(vector).clamp_min(1e-8)
-        return scaled.clamp(
-            min=-self.interaction_rms_clip,
-            max=self.interaction_rms_clip,
-        )
-
-    def interaction_pair_residual_from_vector(
-        self,
-        projected: Mapping[str, torch.Tensor],
-        routing_weights: torch.Tensor,
-        interaction_vector: torch.Tensor,
-        eps: float = 1e-8,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build a signed, attribution-gated joint representation residual.
-
-        All encoder tensors must be patch aligned. Pairwise Hadamard products
-        stay in the common projection space; a zero-initialized per-dimension
-        gate selects stable joint features. Division by Z_q prevents growth
-        with the number of encoder pairs.
-        """
-        tensors = [projected[name] for name in self.encoder_names]
-        first_shape = tensors[0].shape
-        for name, tensor in zip(self.encoder_names, tensors):
-            if tensor.shape != first_shape:
-                raise ValueError(
-                    "Pairwise interaction fusion requires aligned projected tensors; "
-                    f"expected {tuple(first_shape)}, got {tuple(tensor.shape)} for {name}."
-                )
-        weights = routing_weights.reshape(-1)
-        if weights.numel() != len(self.encoder_names):
-            raise ValueError(
-                f"Expected {len(self.encoder_names)} routing weights, got {weights.numel()}."
-            )
-        vector = interaction_vector.reshape(-1)
-        if vector.numel() != len(self.interaction_pairs):
-            raise ValueError(
-                f"Expected {len(self.interaction_pairs)} interactions, got {vector.numel()}."
-            )
-
-        scaled = self.scale_interaction_vector(vector)
-        normalized = {
-            name: F.layer_norm(projected[name], (self.target_dim,))
-            for name in self.encoder_names
-        }
-        numerator = torch.zeros_like(tensors[0])
-        z_q = weights.new_zeros(())
-        for pair_index, (i, j) in enumerate(self.interaction_pairs):
-            pair_gate = torch.sqrt((weights[i] * weights[j]).clamp_min(0.0))
-            pair_feature = (
-                normalized[self.encoder_names[i]]
-                * normalized[self.encoder_names[j]]
-            )
-            numerator = numerator + pair_gate * scaled[pair_index] * pair_feature
-            z_q = z_q + pair_gate
-        pair_representation = numerator / z_q.clamp_min(eps)
-        pair_residual = (
-            self.interaction_pair_beta
-            * torch.tanh(self.interaction_gate)
-            * torch.tanh(pair_representation)
-        )
-        return pair_residual, scaled
-
-    def interaction_pair_residual(
-        self,
-        projected: Mapping[str, torch.Tensor],
-        routing_weights: torch.Tensor,
-        interactions: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.interaction_pair_residual_from_vector(
-            projected,
-            routing_weights,
-            self.flatten_interactions(interactions),
-        )
-
     def forward_stage2(
         self,
         raw_features: Mapping[str, torch.Tensor],
         baselines: Mapping[str, Mapping[str, torch.Tensor]],
         replacement_strategy: str = "mean",
         gaussian_std_scale: float = 1.0,
-        compute_interactions: bool = True,
+        compute_interactions: bool = False,
         return_attribution_logits: bool = False,
         use_student_router: bool = False,
     ):
@@ -369,29 +264,16 @@ class GMEModel(nn.Module):
             baselines=baselines,
             replacement_strategy=replacement_strategy,
             gaussian_std_scale=gaussian_std_scale,
-            compute_interactions=compute_interactions and self.interaction_pair_beta > 0.0,
+            compute_interactions=compute_interactions,
             interaction_target_class=1,
         )
         routed = self.route_with_scores(projected, attribution_scores=attr)
-        if compute_interactions and self.interaction_pair_beta > 0.0:
-            pair_residual, scaled_interactions = self.interaction_pair_residual(
-                projected,
-                routed.weights,
-                interactions,
-            )
-            final_fused = routed.fused + pair_residual
-        else:
-            pair_residual = torch.zeros_like(routed.fused)
-            scaled_interactions = routed.fused.new_zeros(len(self.interaction_pairs))
-            final_fused = routed.fused
-            interactions = routed.fused.new_zeros(
-                (len(self.encoder_names), len(self.encoder_names))
-            )
-        logits, attn = self.classifier(final_fused)
-        if return_attribution_logits and self.interaction_pair_beta > 0.0:
-            attribution_logits, _ = self.classifier(routed.fused)
-        else:
-            attribution_logits = logits.detach()
+        # Interactions are a post-hoc analysis quantity. They are never fused
+        # into the representation or exposed to the optimizer/inference path.
+        logits, attn = self.classifier(routed.fused)
+        if not compute_interactions:
+            interactions = logits.new_zeros((len(self.encoder_names), len(self.encoder_names)))
+        attribution_logits = logits.detach()
         return (
             logits,
             attn,
@@ -401,8 +283,8 @@ class GMEModel(nn.Module):
             single_attr,
             interactions,
             attribution_logits,
-            pair_residual,
-            scaled_interactions,
+            torch.zeros_like(routed.fused),
+            logits.new_zeros(len(self.interaction_pairs)),
         )
 
 

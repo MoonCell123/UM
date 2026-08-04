@@ -430,6 +430,7 @@ PyYAML>=6.0
 
 python code\train\train_gme.py --config code\config\gme.yml
 python code\train\train_offline_fusion_baselines.py --config code\config\offline_fusion_baselines.yml
+python code/train/run_gme_workflow.py --workflow-mode analysis_only --analysis-source-run-dir output/
 
 ## 多卡协同训练
 跑GME方法：

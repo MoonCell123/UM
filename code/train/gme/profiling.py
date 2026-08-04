@@ -19,7 +19,7 @@ def move_features(features: Mapping[str, torch.Tensor], device: torch.device) ->
 
 
 class GMEProfileWrapper(nn.Module):
-    """Traceable online inference with attribution/interaction supplied offline."""
+    """Traceable online inference with attribution supplied offline."""
 
     def __init__(
         self,
@@ -42,20 +42,13 @@ class GMEProfileWrapper(nn.Module):
             routed = self.model.route_with_student(projected)
             logits, _ = self.model.classifier(routed.fused)
             return logits
-        attribution_scores = feature_tensors[-2]
-        interaction_vector = feature_tensors[-1]
+        attribution_scores = feature_tensors[-1]
         raw_features = {
-            name: tensor
-            for name, tensor in zip(self.encoder_names, feature_tensors[:-2])
+            name: tensor for name, tensor in zip(self.encoder_names, feature_tensors[:-1])
         }
         projected = self.model.project(raw_features)
         routed = self.model.route_with_scores(projected, attribution_scores)
-        pair_residual, _ = self.model.interaction_pair_residual_from_vector(
-            projected,
-            routed.weights,
-            interaction_vector,
-        )
-        logits, _ = self.model.classifier(routed.fused + pair_residual)
+        logits, _ = self.model.classifier(routed.fused)
         return logits
 
 
@@ -85,21 +78,18 @@ def profile_sample_tuples(
     samples: Sequence[Mapping[str, torch.Tensor]],
     encoder_names: Sequence[str],
     attribution_scores: Sequence[torch.Tensor] | None = None,
-    interaction_vectors: Sequence[torch.Tensor] | None = None,
 ) -> List[Tuple[torch.Tensor, ...]]:
     feature_tuples = [
         tuple(raw_features[name] for name in encoder_names)
         for raw_features in samples
     ]
-    if attribution_scores is None and interaction_vectors is None:
+    if attribution_scores is None:
         return feature_tuples
-    if attribution_scores is None or interaction_vectors is None:
-        raise ValueError("Attribution scores and interaction vectors must be supplied together.")
-    if len(feature_tuples) != len(attribution_scores) or len(feature_tuples) != len(interaction_vectors):
+    if len(feature_tuples) != len(attribution_scores):
         raise ValueError("Profile samples and offline routing inputs must have the same length.")
     return [
-        features + (scores, interaction)
-        for features, scores, interaction in zip(feature_tuples, attribution_scores, interaction_vectors)
+        features + (scores,)
+        for features, scores in zip(feature_tuples, attribution_scores)
     ]
 
 
@@ -187,7 +177,6 @@ def profile_gme_efficiency(
     model.eval()
     with torch.no_grad():
         offline_scores = []
-        offline_interactions = []
         if not use_student_router:
             for raw_features in raw_samples:
                 projected = model.project(raw_features)
@@ -198,21 +187,12 @@ def profile_gme_efficiency(
                     gaussian_std_scale=gaussian_std_scale,
                     compute_interactions=False,
                 )
-                _, _, interactions = model.intervention_attribution(
-                    projected=projected,
-                    baselines=baselines,
-                    replacement_strategy=replacement_strategy,
-                    gaussian_std_scale=gaussian_std_scale,
-                    compute_interactions=True,
-                    interaction_target_class=1,
-                )
                 offline_scores.append(routing_scores.detach())
-                offline_interactions.append(model.flatten_interactions(interactions).detach())
     model.train(was_training)
     profile_inputs = (
         profile_sample_tuples(raw_samples, model.encoder_names)
         if use_student_router
-        else profile_sample_tuples(raw_samples, model.encoder_names, offline_scores, offline_interactions)
+        else profile_sample_tuples(raw_samples, model.encoder_names, offline_scores)
     )
     wrapper = GMEProfileWrapper(
         model, model.encoder_names, use_student_router=use_student_router

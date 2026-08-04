@@ -20,6 +20,7 @@ DEFAULT_FEATURE_DIRS = [
     "features_hoptimus0",
 ]
 PATH_ARGS = ("manifest", "manifest_dir", "output_dir", "run_dir")
+WORKFLOW_MODES = ("fusion_only", "analysis_only", "fusion_and_analysis")
 
 
 def load_config_file(config_path: Path | None) -> Dict[str, object]:
@@ -73,6 +74,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Exact output directory for this run. Overrides --output-dir/--experiment-name timestamp layout.",
+    )
+    parser.add_argument(
+        "--workflow-mode",
+        choices=WORKFLOW_MODES,
+        default="fusion_only",
+        help="Workflow launcher mode. train_gme.py itself only accepts fusion_only.",
+    )
+    parser.add_argument(
+        "--analysis-source-run-dir",
+        type=Path,
+        default=None,
+        help="Existing GME run directory used by the analysis_only workflow.",
     )
     parser.add_argument("--label-col", default="d3m3")
     parser.add_argument("--folds", type=int, nargs="*", default=None, help="Fold ids to run. Default: all folds.")
@@ -172,30 +185,6 @@ def parse_args() -> argparse.Namespace:
             "'predicted_class' explains the current mean-fusion decision; "
             "'class_1' uses z1-z0 for every sample."
         ),
-    )
-    parser.add_argument(
-        "--interaction-pair-beta",
-        type=float,
-        default=0.1,
-        help="Scale of the signed pairwise residual added to the attribution-fused representation.",
-    )
-    parser.add_argument(
-        "--interaction-pair-weight-decay",
-        type=float,
-        default=0.01,
-        help="AdamW weight decay applied only to the interaction feature gate.",
-    )
-    parser.add_argument(
-        "--interaction-pair-lr",
-        type=float,
-        default=1e-3,
-        help="Learning rate for the zero-initialized interaction feature gate.",
-    )
-    parser.add_argument(
-        "--interaction-rms-clip",
-        type=float,
-        default=3.0,
-        help="Absolute clipping bound after train-only per-pair RMS scaling without centering.",
     )
     parser.add_argument(
         "--routing-temperature",
@@ -305,14 +294,6 @@ def parse_args() -> argparse.Namespace:
     args.config = config_args.config
     if not 0.0 < float(args.inner_val_fraction) < 1.0:
         raise ValueError("--inner-val-fraction must be between 0 and 1.")
-    if float(args.interaction_pair_beta) < 0.0:
-        raise ValueError("--interaction-pair-beta must be non-negative.")
-    if float(args.interaction_pair_weight_decay) < 0.0:
-        raise ValueError("--interaction-pair-weight-decay must be non-negative.")
-    if float(args.interaction_pair_lr) <= 0.0:
-        raise ValueError("--interaction-pair-lr must be positive.")
-    if float(args.interaction_rms_clip) <= 0.0:
-        raise ValueError("--interaction-rms-clip must be positive.")
     if int(args.teacher_epochs) < 1:
         raise ValueError("--teacher-epochs must be at least 1.")
     if int(args.teacher_patience) < 1:
@@ -335,11 +316,6 @@ def parse_args() -> argparse.Namespace:
         raise ValueError(
             "--routing-mode=teacher_student currently requires "
             "--training-protocol=fixed_split_no_refit so teacher targets remain train-only."
-        )
-    if args.routing_mode == "teacher_student" and float(args.interaction_pair_beta) != 0.0:
-        raise ValueError(
-            "--routing-mode=teacher_student currently requires --interaction-pair-beta=0. "
-            "The student router path does not use online interaction residuals."
         )
     if not 0.0 < float(args.ema_decay) < 1.0:
         raise ValueError("--ema-decay must be between 0 and 1.")

@@ -16,6 +16,8 @@ clinical_path: "G:/Fanglun/Project/UM/clinical_information.csv"
 output_dir: "output/GME"
 experiment_name: "gme"
 label_col: "d3m3"
+workflow_mode: "fusion_and_analysis"  # fusion_only | analysis_only | fusion_and_analysis
+analysis_source_run_dir: null            # analysis_only need fusion result dir
 folds: null     
 training_protocol: "fixed_split_no_refit"  # nested_refit or fixed_split_no_refit; use folds: [1] to train once
 seed: 42
@@ -53,12 +55,6 @@ threshold: 0.5
 replacement_strategy: "mean"    # embedding mask way
 gaussian_std_scale: 1.0
 attribution_target: "predicted_class"
-# del interaction param just for analysis
-interaction_pair_beta: 0.0
-interaction_pair_lr: 0.001
-interaction_pair_weight_decay: 0.01
-interaction_rms_clip: 3.0
-
 routing_mode: "teacher_student"  # online_attribution or teacher_student
 teacher_epochs: 20
 teacher_patience: 5

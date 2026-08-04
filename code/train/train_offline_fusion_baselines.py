@@ -1247,11 +1247,6 @@ def main() -> None:
     print(f"Methods: {methods}")
     print(f"Folds: {folds}")
     print(f"Training protocol: {args.training_protocol}")
-    if args.training_protocol == "fixed_split_no_refit" and len(folds) > 1:
-        print(
-            "[Note] fixed_split_no_refit runs once per selected fold. "
-            "Set folds: [1] for a single fixed train/validation/test experiment."
-        )
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"CUDA device: {torch.cuda.current_device()} | {torch.cuda.get_device_name(device)}")
