@@ -17,9 +17,6 @@
 *.vrb
 *.xdv
 
-# Generated PDFs (uncomment to ignore compiled PDFs)
-*.pdf
-
 # Backup files
 *~
 *.bak

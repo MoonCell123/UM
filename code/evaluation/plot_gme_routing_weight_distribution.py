@@ -23,6 +23,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
+plt.rcParams["svg.fonttype"] = "none"
 import numpy as np
 import pandas as pd
 
@@ -265,7 +268,10 @@ def save_figure(weights: pd.DataFrame, slide_summary: pd.DataFrame, encoder_orde
     draw_violin(violin_ax, weights, encoder_order)
     draw_entropy(entropy_ax, slide_summary)
     fig.suptitle("GME Out-of-Fold Routing-Weight Distribution", fontsize=15, fontweight="bold")
-    fig.savefig(output_dir / "gme_routing_weight_distribution.png", dpi=300)
+    output_path = output_dir / "gme_routing_weight_distribution.png"
+    fig.savefig(output_path, dpi=600, bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".pdf"), format="pdf", bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".svg"), format="svg", bbox_inches="tight")
     plt.close(fig)
 
 

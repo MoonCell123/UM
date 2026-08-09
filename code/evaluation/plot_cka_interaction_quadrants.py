@@ -23,6 +23,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
+plt.rcParams["svg.fonttype"] = "none"
 from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
@@ -223,7 +226,9 @@ def plot_quadrants(
         fontsize=8,
         color="#4b5563",
     )
-    fig.savefig(output_path, dpi=240, bbox_inches="tight")
+    fig.savefig(output_path, dpi=600, bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".pdf"), format="pdf", bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".svg"), format="svg", bbox_inches="tight")
     plt.close(fig)
     return cka_threshold, interaction_threshold
 

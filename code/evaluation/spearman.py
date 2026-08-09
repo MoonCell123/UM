@@ -9,8 +9,8 @@ Outputs are written below ``output-dir/<timestamp>``:
 
 * ``wsi_spearman_summary.csv``: one row per WSI and encoder pair;
 * ``encoder_pair_spearman_summary.csv``: WSI-averaged pair-level statistics;
-* ``mean_abs_spearman_heatmap.png`` and ``mean_abs_spearman_matrix.csv``;
-* ``cka_vs_mean_abs_spearman.png`` and its CSV summary when ``--cka-file`` is set;
+* ``mean_abs_spearman_heatmap.{png,pdf,svg}`` and ``mean_abs_spearman_matrix.csv``;
+* ``cka_vs_mean_abs_spearman.{png,pdf,svg}`` and its CSV summary when ``--cka-file`` is set;
 * ``feature_pair_spearman_top.csv``: strongest feature pairs per WSI and encoder pair;
 * ``matrices/``: optional complete feature-pair Spearman matrices;
 * ``errors.csv``: WSIs skipped in non-strict mode.
@@ -29,6 +29,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
+plt.rcParams["svg.fonttype"] = "none"
 import numpy as np
 import pandas as pd
 from scipy.stats import rankdata, spearmanr
@@ -315,7 +318,10 @@ def plot_mean_abs_heatmap(
     ax.set_title("Mean absolute feature-level Spearman correlation")
     colorbar = fig.colorbar(image, ax=ax, shrink=0.88)
     colorbar.set_label("Mean absolute rho")
-    fig.savefig(output_dir / "mean_abs_spearman_heatmap.png", dpi=300, bbox_inches="tight")
+    output_path = output_dir / "mean_abs_spearman_heatmap.png"
+    fig.savefig(output_path, dpi=600, bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".pdf"), format="pdf", bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".svg"), format="svg", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -370,7 +376,10 @@ def write_cka_correspondence(
         pad=12,
     )
     ax.grid(alpha=0.25)
-    fig.savefig(output_dir / "cka_vs_mean_abs_spearman.png", dpi=300, bbox_inches="tight")
+    output_path = output_dir / "cka_vs_mean_abs_spearman.png"
+    fig.savefig(output_path, dpi=600, bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".pdf"), format="pdf", bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".svg"), format="svg", bbox_inches="tight")
     plt.close(fig)
 
 

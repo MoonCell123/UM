@@ -32,6 +32,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
+plt.rcParams["svg.fonttype"] = "none"
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 from scipy.spatial.distance import squareform
 
@@ -236,7 +239,9 @@ def plot_heatmap(similarity: np.ndarray, names: Sequence[str], order: np.ndarray
             color = "white" if ordered_matrix[row, col] < 0.55 else "black"
             ax.text(col, row, f"{ordered_matrix[row, col]:.2f}", ha="center", va="center", fontsize=6, color=color)
     fig.colorbar(image, ax=ax, label="Linear CKA similarity")
-    fig.savefig(output_path, dpi=240)
+    fig.savefig(output_path, dpi=600, bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".pdf"), format="pdf", bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".svg"), format="svg", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -246,7 +251,9 @@ def plot_dendrogram(linkage_matrix: np.ndarray, names: Sequence[str], output_pat
     ax.set_title("Foundation Model Clustering from 1 - Linear CKA")
     ax.set_ylabel("Average-linkage distance")
     ax.grid(axis="y", alpha=0.25)
-    fig.savefig(output_path, dpi=240)
+    fig.savefig(output_path, dpi=600, bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".pdf"), format="pdf", bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".svg"), format="svg", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -295,7 +302,9 @@ def plot_profile_pca(
         fontsize=7,
         frameon=False,
     )
-    fig.savefig(output_path, dpi=240)
+    fig.savefig(output_path, dpi=600, bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".pdf"), format="pdf", bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".svg"), format="svg", bbox_inches="tight")
     plt.close(fig)
 
 
