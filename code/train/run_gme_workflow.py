@@ -1,13 +1,14 @@
 """Run the GME fusion branch and/or its post-hoc analysis branch.
 
 The training entry point remains ``train_gme.py``.  This launcher owns the
-workflow-level sequencing so CKA, Spearman, and pairwise interactions never
-become part of model training or inference.
+workflow-level sequencing so CKA, Spearman, pairwise interactions, and
+post-hoc routing analyses never become part of model training or inference.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import subprocess
 import sys
@@ -79,6 +80,34 @@ def run_command(command: list[str], label: str) -> None:
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
 
 
+def validate_spearman_pairs(spearman_root: Path, feature_dirs: list[str]) -> Path:
+    candidates = sorted(
+        spearman_root.rglob("encoder_pair_spearman_summary.csv"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise RuntimeError("Spearman completed without producing encoder_pair_spearman_summary.csv.")
+    summary_path = candidates[0]
+    with open(summary_path, "r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    pairs = {
+        tuple(sorted((str(row["encoder_a"]), str(row["encoder_b"]))))
+        for row in rows
+    }
+    expected = {
+        tuple(sorted((feature_dirs[left], feature_dirs[right])))
+        for left in range(len(feature_dirs))
+        for right in range(left + 1, len(feature_dirs))
+    }
+    if pairs != expected:
+        raise RuntimeError(
+            "Spearman pair coverage is incomplete or inconsistent. "
+            f"Expected {len(expected)} pairs from {feature_dirs}, found {len(pairs)} in {summary_path}."
+        )
+    return summary_path
+
+
 def run_fusion(config_path: Path, run_dir: Path) -> None:
     run_dir.parent.mkdir(parents=True, exist_ok=True)
     command = [
@@ -138,6 +167,13 @@ def run_analysis(source_run_dir: Path, analysis_dir: Path, device_override: str 
         device,
     ]
     run_command(cka_command, "analysis: CKA")
+    cka_files = sorted(
+        (analysis_dir / "cka").rglob("pairwise_cka_by_wsi.csv"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not cka_files:
+        raise RuntimeError("CKA completed without producing pairwise_cka_by_wsi.csv.")
 
     spearman_command = [
         sys.executable,
@@ -145,14 +181,16 @@ def run_analysis(source_run_dir: Path, analysis_dir: Path, device_override: str 
         "--manifest",
         str(manifest),
         "--feature-dirs",
-        feature_dirs[0],
-        feature_dirs[1],
+        *feature_dirs,
         "--output-dir",
         str(analysis_dir / "spearman"),
         "--device",
         device,
+        "--cka-file",
+        str(cka_files[0]),
     ]
     run_command(spearman_command, "analysis: Spearman")
+    validate_spearman_pairs(analysis_dir / "spearman", feature_dirs)
 
     fold_dirs = sorted(
         (path for path in source_run_dir.glob("fold_*") if path.is_dir()),
@@ -188,6 +226,28 @@ def run_analysis(source_run_dir: Path, analysis_dir: Path, device_override: str 
         ]
         run_command(interaction_command, f"analysis: interaction fold {fold}")
 
+    quadrant_command = [
+        sys.executable,
+        str(PROJECT_ROOT / "code" / "evaluation" / "plot_cka_interaction_quadrants.py"),
+        "--cka-root",
+        str(analysis_dir / "cka"),
+        "--interaction-root",
+        str(analysis_dir / "interactions"),
+        "--output-dir",
+        str(analysis_dir / "cka_interaction_quadrants"),
+    ]
+    run_command(quadrant_command, "analysis: CKA-interaction quadrants")
+
+    routing_weight_command = [
+        sys.executable,
+        str(PROJECT_ROOT / "code" / "evaluation" / "plot_gme_routing_weight_distribution.py"),
+        "--run-dir",
+        str(source_run_dir),
+        "--output-dir",
+        str(analysis_dir / "routing_weight_distribution"),
+    ]
+    run_command(routing_weight_command, "analysis: OOF routing-weight distribution")
+
     with open(analysis_dir / "workflow_manifest.json", "w", encoding="utf-8") as handle:
         json.dump(
             {
@@ -196,7 +256,13 @@ def run_analysis(source_run_dir: Path, analysis_dir: Path, device_override: str 
                 "clinical_path": str(clinical_path),
                 "feature_dirs": feature_dirs,
                 "device": device,
-                "analysis": ["linear_cka", "spearman", "pairwise_interactions"],
+                "analysis": [
+                    "linear_cka",
+                    "spearman",
+                    "pairwise_interactions",
+                    "cka_interaction_quadrants",
+                    "oof_routing_weight_distribution",
+                ],
             },
             handle,
             indent=2,

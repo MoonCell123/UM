@@ -16,6 +16,9 @@ from cox_train import compute_cindex
 # 设置中文字体
 plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
+plt.rcParams["svg.fonttype"] = "none"
 
 # 时间点标签常量
 YEAR_LABELS_EN = {12: "1-Year", 24: "2-Year", 36: "3-Year", 48: "4-Year", 60: "5-Year"}
@@ -267,6 +270,8 @@ def plot_km_curve(risk_scores, times, events, threshold,
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.savefig(save_path.replace(".png", ".pdf"), format="pdf",
+                    bbox_inches="tight")
+        plt.savefig(save_path.replace(".png", ".svg"), format="svg",
                     bbox_inches="tight")
         print(f"  KM曲线已保存: {save_path}")
     plt.close()
@@ -627,6 +632,8 @@ def plot_time_dependent_roc(train_times, train_events,
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.savefig(save_path.replace(".png", ".pdf"), format="pdf",
                     bbox_inches="tight")
+        plt.savefig(save_path.replace(".png", ".svg"), format="svg",
+                    bbox_inches="tight")
         print(f"  Time-dependent ROC 已保存: {save_path}")
     plt.close()
 
@@ -867,6 +874,8 @@ def plot_dca_curves(train_times, train_events, train_risk_scores,
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.savefig(save_path.replace(".png", ".pdf"), format="pdf",
+                    bbox_inches="tight")
+        plt.savefig(save_path.replace(".png", ".svg"), format="svg",
                     bbox_inches="tight")
         print(f"  DCA曲线已保存: {save_path}")
     plt.close()

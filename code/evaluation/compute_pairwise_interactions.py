@@ -30,6 +30,7 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 from architecture.gme_model import GMEModel
+from data_utils.cls_dataset import load_uvm_data
 from data_utils.gme_dataset import MultiEncoderSlideDataset
 from train.gme.experiment import build_replacement_baselines, move_features
 
@@ -133,7 +134,16 @@ def build_model(run_config: Mapping[str, object], checkpoint_payload: Mapping[st
     state_dict = checkpoint_payload.get("state_dict")
     if not isinstance(state_dict, dict):
         raise ValueError("Checkpoint does not contain a state_dict.")
-    model.load_state_dict(state_dict)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    # Checkpoints produced before interaction was moved to the analysis branch
+    # contain the retired gate/statistics tensors. They are intentionally
+    # ignored; projection, router, and classifier weights remain compatible.
+    unexpected = [name for name in unexpected if not name.startswith("interaction_")]
+    if unexpected:
+        raise ValueError(f"Checkpoint has incompatible unexpected parameters: {unexpected}")
+    missing = [name for name in missing if not name.startswith("interaction_")]
+    if missing:
+        raise ValueError(f"Checkpoint is missing model parameters: {missing}")
     model.eval()
     return model
 
@@ -159,7 +169,9 @@ def main() -> None:
     label_col = args.label_col or run_config.get("label_col", "d3m3")
     if not clinical_path:
         raise ValueError("Clinical path is required; pass --clinical-path or use a run config containing it.")
-    clinical_df = pd.read_csv(clinical_path)
+    # Match the training path: the clinical CSV stores ``SCNA Cluster No.``
+    # and load_uvm_data derives the binary ``d3m3`` label used by GME.
+    clinical_df, _, _ = load_uvm_data(str(clinical_path), str(label_col))
     clinical_df["slide_id"] = clinical_df["slide_id"].astype(str)
     manifest = pd.read_csv(args.manifest)
     if fold not in set(manifest["fold"].dropna().astype(int)):
