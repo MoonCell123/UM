@@ -4,8 +4,9 @@ This script is intentionally self-contained for server runs:
 
 1. Read a middle-fusion manifest of multi-encoder h5 embeddings.
 2. For each CV fold, train ProjectionHead, router, and ABMIL together.
-3. Rebuild train-only replacement baselines from the current projection space.
-4. Train GME with intervention attribution.
+3. Use intervention attribution only when online routing or teacher
+   distillation is enabled; otherwise keep it as a separate post-hoc analysis.
+4. Report GME performance, attribution-independent routing, and efficiency.
 5. Report AUC, AUPRC, efficiency metrics, and save checkpoints/artifacts.
 
 The intervention score is computed as the prediction drop after replacing one
@@ -501,6 +502,18 @@ def update_train_offline_stats(
     return model.router.get_score_stats(), interaction_stats
 
 
+def inactive_attribution_stats(model: GMEModel) -> Tuple[Dict[str, float], Dict[str, object]]:
+    """Return placeholder metadata when attribution routing is not used."""
+    return model.router.get_score_stats(), {
+        "count": 0,
+        "pair_names": [
+            f"{model.encoder_names[i]}__{model.encoder_names[j]}"
+            for i, j in model.interaction_pairs
+        ],
+        "analysis_only": True,
+    }
+
+
 def train_mean_teacher_epoch(
     model: GMEModel,
     dataset,
@@ -599,14 +612,17 @@ def train_teacher_student_epoch(
     optimizer,
     device: torch.device,
     baselines: Mapping[str, Mapping[str, torch.Tensor]],
-    teacher_targets: Mapping[str, torch.Tensor],
+    teacher_targets: Mapping[str, torch.Tensor] | None,
     distill_weight: float,
     max_distill_loss_ratio: float,
     grad_clip: float,
     weight_averager: ExponentialMovingAverage | None = None,
 ) -> Tuple[float, float, float, float]:
-    """Train a label-free student router against cached teacher soft targets."""
+    """Train the student router with classification and optional distillation."""
     projection_is_trainable = any(param.requires_grad for param in model.projection_heads.parameters())
+    use_distillation = float(distill_weight) > 0.0
+    if use_distillation and teacher_targets is None:
+        raise RuntimeError("Teacher targets are required when distillation is enabled.")
     model.train()
     if not projection_is_trainable:
         model.projection_heads.eval()
@@ -619,11 +635,15 @@ def train_teacher_student_epoch(
     for idx in np.random.permutation(len(dataset)):
         raw_features, label, slide_id = dataset[int(idx)]
         slide_id = str(slide_id)
-        if slide_id not in teacher_targets:
+        if use_distillation and slide_id not in teacher_targets:
             raise KeyError(f"Missing teacher attribution target for slide {slide_id}")
         raw_features = move_features(raw_features, device)
         label_t = torch.tensor([label], dtype=torch.long, device=device)
-        target_weights = teacher_targets[slide_id].to(device=device)
+        target_weights = (
+            teacher_targets[slide_id].to(device=device)
+            if use_distillation
+            else None
+        )
 
         optimizer.zero_grad(set_to_none=True)
         (
@@ -636,19 +656,23 @@ def train_teacher_student_epoch(
             use_student_router=True,
         )
         cls_loss = criterion(logits, label_t)
-        distill_loss = F.kl_div(
-            routed.weights.clamp_min(1e-8).log(),
-            target_weights,
-            reduction="sum",
-        )
-        effective_distill_weight = float(distill_weight)
-        if effective_distill_weight > 0.0 and max_distill_loss_ratio > 0.0:
-            effective_distill_weight = min(
-                effective_distill_weight,
-                float(max_distill_loss_ratio)
-                * float(cls_loss.detach())
-                / (float(distill_loss.detach()) + 1e-8),
+        if use_distillation:
+            distill_loss = F.kl_div(
+                routed.weights.clamp_min(1e-8).log(),
+                target_weights,
+                reduction="sum",
             )
+            effective_distill_weight = float(distill_weight)
+            if max_distill_loss_ratio > 0.0:
+                effective_distill_weight = min(
+                    effective_distill_weight,
+                    float(max_distill_loss_ratio)
+                    * float(cls_loss.detach())
+                    / (float(distill_loss.detach()) + 1e-8),
+                )
+        else:
+            distill_loss = cls_loss.new_zeros(())
+            effective_distill_weight = 0.0
         loss = cls_loss + effective_distill_weight * distill_loss
         loss.backward()
         if grad_clip > 0:
@@ -953,6 +977,8 @@ def run_fold(
     fold_dir = output_dir / f"fold_{fold}"
     fold_dir.mkdir(parents=True, exist_ok=True)
     use_teacher_student = args.routing_mode == "teacher_student"
+    use_online_attribution = not use_teacher_student
+    use_teacher_distillation = use_teacher_student and float(args.teacher_distill_weight) > 0.0
 
     train_ds = MultiEncoderSlideDataset(
         manifest=manifest,
@@ -1221,40 +1247,46 @@ def run_fold(
         for parameter in teacher.parameters():
             parameter.requires_grad_(False)
 
-        teacher_baselines, teacher_baseline_summary = build_replacement_baselines(
-            teacher,
-            inner_baseline_ds,
-            device,
-        )
-        teacher_targets, teacher_target_rows = build_teacher_attribution_targets(
-            teacher=teacher,
-            dataset=inner_score_stats_ds,
-            device=device,
-            baselines=teacher_baselines,
-            replacement_strategy=args.replacement_strategy,
-            gaussian_std_scale=args.gaussian_std_scale,
-            temperature=args.teacher_target_temperature,
-            clip=args.teacher_target_clip,
-        )
-        teacher_target_rows.to_csv(
-            fold_dir / "teacher_attribution_targets.csv",
-            index=False,
-            encoding="utf-8-sig",
-            float_format="%.6f",
-        )
-        teacher_baseline_summary.to_csv(
-            fold_dir / "teacher_replacement_baseline_summary.csv",
-            index=False,
-            encoding="utf-8-sig",
-        )
-        torch.save({
-            "targets": teacher_targets,
-            "encoder_names": teacher.encoder_names,
-            "teacher_checkpoint": str(teacher_best_path),
-            "target_temperature": float(args.teacher_target_temperature),
-            "target_clip": float(args.teacher_target_clip),
-            "target": "true_label_logit_margin_loo",
-        }, fold_dir / "teacher_attribution_targets.pt")
+        if use_teacher_distillation:
+            teacher_baselines, teacher_baseline_summary = build_replacement_baselines(
+                teacher,
+                inner_baseline_ds,
+                device,
+            )
+            teacher_targets, teacher_target_rows = build_teacher_attribution_targets(
+                teacher=teacher,
+                dataset=inner_score_stats_ds,
+                device=device,
+                baselines=teacher_baselines,
+                replacement_strategy=args.replacement_strategy,
+                gaussian_std_scale=args.gaussian_std_scale,
+                temperature=args.teacher_target_temperature,
+                clip=args.teacher_target_clip,
+            )
+            teacher_target_rows.to_csv(
+                fold_dir / "teacher_attribution_targets.csv",
+                index=False,
+                encoding="utf-8-sig",
+                float_format="%.6f",
+            )
+            teacher_baseline_summary.to_csv(
+                fold_dir / "teacher_replacement_baseline_summary.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+            torch.save({
+                "targets": teacher_targets,
+                "encoder_names": teacher.encoder_names,
+                "teacher_checkpoint": str(teacher_best_path),
+                "target_temperature": float(args.teacher_target_temperature),
+                "target_clip": float(args.teacher_target_clip),
+                "target": "true_label_logit_margin_loo",
+            }, fold_dir / "teacher_attribution_targets.pt")
+        else:
+            print(
+                f"Fold {fold}: teacher_distill_weight={args.teacher_distill_weight:g}; "
+                "skipping teacher LOO targets and replacement baselines."
+            )
 
         # Warm-start the student representation and classifier from the frozen
         # teacher; the embedding router itself remains label-free at inference.
@@ -1294,25 +1326,30 @@ def run_fold(
                 else ""
             )
         )
-    baselines, baseline_summary = build_replacement_baselines(
-        model,
-        inner_baseline_ds,
-        device,
-    )
-    score_stats, interaction_stats = update_train_offline_stats(
-        model=model,
-        dataset=inner_score_stats_ds,
-        device=device,
-        baselines=baselines,
-        replacement_strategy=args.replacement_strategy,
-        gaussian_std_scale=args.gaussian_std_scale,
-    )
+    if use_online_attribution:
+        baselines, baseline_summary = build_replacement_baselines(
+            model,
+            inner_baseline_ds,
+            device,
+        )
+        score_stats, interaction_stats = update_train_offline_stats(
+            model=model,
+            dataset=inner_score_stats_ds,
+            device=device,
+            baselines=baselines,
+            replacement_strategy=args.replacement_strategy,
+            gaussian_std_scale=args.gaussian_std_scale,
+        )
+    else:
+        baselines = {}
+        baseline_summary = pd.DataFrame()
+        score_stats, interaction_stats = inactive_attribution_stats(model)
 
     for epoch in range(1, args.stage2_epochs + 1):
         if ema is not None and not ema.initialized and epoch >= args.ema_start_epoch:
             ema.initialize(model)
         if use_teacher_student:
-            if teacher_targets is None:
+            if use_teacher_distillation and teacher_targets is None:
                 raise RuntimeError("Teacher targets were not initialized.")
             (
                 train_loss,
@@ -1345,26 +1382,27 @@ def run_fold(
             )
             train_distill_loss = float("nan")
             effective_distill_weight = float("nan")
-        if not args.freeze_projection_stage2:
+        if use_online_attribution and not args.freeze_projection_stage2:
             baselines, baseline_summary = build_replacement_baselines(
                 model,
                 inner_baseline_ds,
                 device,
             )
-        score_stats, interaction_stats = update_train_offline_stats(
-            model=model,
-            dataset=inner_score_stats_ds,
-            device=device,
-            baselines=baselines,
-            replacement_strategy=args.replacement_strategy,
-            gaussian_std_scale=args.gaussian_std_scale,
-        )
+        if use_online_attribution:
+            score_stats, interaction_stats = update_train_offline_stats(
+                model=model,
+                dataset=inner_score_stats_ds,
+                device=device,
+                baselines=baselines,
+                replacement_strategy=args.replacement_strategy,
+                gaussian_std_scale=args.gaussian_std_scale,
+            )
         scheduler2.step()
         use_ema_for_eval = ema is not None and ema.initialized
         evaluation_context = ema.average_parameters(model) if use_ema_for_eval else nullcontext()
         with evaluation_context:
             evaluation_weight_source = "ema" if use_ema_for_eval else "raw"
-            if use_ema_for_eval:
+            if use_ema_for_eval and use_online_attribution:
                 eval_baselines, eval_baseline_summary = build_replacement_baselines(
                     model,
                     inner_baseline_ds,
@@ -1449,24 +1487,32 @@ def run_fold(
                         ),
                     },
                 )
-                baseline_payload = {
-                    "fold": int(fold),
-                    "baselines": {
-                        name: {key: value.detach().cpu() if torch.is_tensor(value) else value for key, value in stats.items()}
-                        for name, stats in eval_baselines.items()
-                    },
-                    "input_dims": input_dims,
-                    "encoder_names": model.encoder_names,
-                    "weight_source": evaluation_weight_source,
-                    "policy": (
-                        "Train-only replacement baselines built once from frozen Stage1 projection."
-                        if args.freeze_projection_stage2
-                        else "Train-only replacement baselines rebuilt from the current end-to-end projection space."
-                    ),
-                    "routing_score_stats": eval_score_stats,
-                }
-                torch.save(baseline_payload, fold_dir / "replacement_baselines.pt")
-                eval_baseline_summary.to_csv(fold_dir / "replacement_baseline_summary.csv", index=False, encoding="utf-8-sig")
+                if use_online_attribution:
+                    baseline_payload = {
+                        "fold": int(fold),
+                        "baselines": {
+                            name: {
+                                key: value.detach().cpu() if torch.is_tensor(value) else value
+                                for key, value in stats.items()
+                            }
+                            for name, stats in eval_baselines.items()
+                        },
+                        "input_dims": input_dims,
+                        "encoder_names": model.encoder_names,
+                        "weight_source": evaluation_weight_source,
+                        "policy": (
+                            "Train-only replacement baselines built once from frozen Stage1 projection."
+                            if args.freeze_projection_stage2
+                            else "Train-only replacement baselines rebuilt from the current end-to-end projection space."
+                        ),
+                        "routing_score_stats": eval_score_stats,
+                    }
+                    torch.save(baseline_payload, fold_dir / "replacement_baselines.pt")
+                    eval_baseline_summary.to_csv(
+                        fold_dir / "replacement_baseline_summary.csv",
+                        index=False,
+                        encoding="utf-8-sig",
+                    )
                 save_fold_outputs(
                     fold_dir, "inner_selection", val_metrics, val_pred, val_weights,
                     interactions=val_interactions,
@@ -1497,15 +1543,19 @@ def run_fold(
             if args.weight_averaging == "ema"
             else None
         )
-        baselines, _ = build_replacement_baselines(model, baseline_ds, device)
-        _, final_interaction_stats = update_train_offline_stats(
-            model=model,
-            dataset=score_stats_ds,
-            device=device,
-            baselines=baselines,
-            replacement_strategy=args.replacement_strategy,
-            gaussian_std_scale=args.gaussian_std_scale,
-        )
+        if use_online_attribution:
+            baselines, baseline_summary = build_replacement_baselines(model, baseline_ds, device)
+            _, final_interaction_stats = update_train_offline_stats(
+                model=model,
+                dataset=score_stats_ds,
+                device=device,
+                baselines=baselines,
+                replacement_strategy=args.replacement_strategy,
+                gaussian_std_scale=args.gaussian_std_scale,
+            )
+        else:
+            baselines = {}
+            final_interaction_stats = inactive_attribution_stats(model)[1]
         for retrain_epoch in range(1, selected_epoch + 1):
             if (
                 retrain_ema is not None
@@ -1529,30 +1579,32 @@ def run_fold(
                 ),
             )
             retrain_scheduler.step()
-            if not args.freeze_projection_stage2:
-                baselines, _ = build_replacement_baselines(model, baseline_ds, device)
-            _, final_interaction_stats = update_train_offline_stats(
-                model=model,
-                dataset=score_stats_ds,
-                device=device,
-                baselines=baselines,
-                replacement_strategy=args.replacement_strategy,
-                gaussian_std_scale=args.gaussian_std_scale,
-            )
+            if use_online_attribution and not args.freeze_projection_stage2:
+                baselines, baseline_summary = build_replacement_baselines(model, baseline_ds, device)
+            if use_online_attribution:
+                _, final_interaction_stats = update_train_offline_stats(
+                    model=model,
+                    dataset=score_stats_ds,
+                    device=device,
+                    baselines=baselines,
+                    replacement_strategy=args.replacement_strategy,
+                    gaussian_std_scale=args.gaussian_std_scale,
+                )
         final_weight_source = "raw"
         if retrain_ema is not None and retrain_ema.initialized:
             retrain_ema.copy_to(model)
             final_weight_source = "ema"
             # Offline statistics must match the averaged model used for test.
-            baselines, _ = build_replacement_baselines(model, baseline_ds, device)
-            _, final_interaction_stats = update_train_offline_stats(
-                model=model,
-                dataset=score_stats_ds,
-                device=device,
-                baselines=baselines,
-                replacement_strategy=args.replacement_strategy,
-                gaussian_std_scale=args.gaussian_std_scale,
-            )
+            if use_online_attribution:
+                baselines, baseline_summary = build_replacement_baselines(model, baseline_ds, device)
+                _, final_interaction_stats = update_train_offline_stats(
+                    model=model,
+                    dataset=score_stats_ds,
+                    device=device,
+                    baselines=baselines,
+                    replacement_strategy=args.replacement_strategy,
+                    gaussian_std_scale=args.gaussian_std_scale,
+                )
         final_ema_num_updates = (
             int(retrain_ema.num_updates) if retrain_ema is not None else 0
         )
@@ -1571,14 +1623,17 @@ def run_fold(
         final_weight_source = str(selected_payload.get("evaluation_weight_source", "raw"))
         final_ema_num_updates = int(selected_payload.get("ema_num_updates", 0))
         baselines, baseline_summary = build_replacement_baselines(model, inner_baseline_ds, device)
-        _, final_interaction_stats = update_train_offline_stats(
-            model=model,
-            dataset=inner_score_stats_ds,
-            device=device,
-            baselines=baselines,
-            replacement_strategy=args.replacement_strategy,
-            gaussian_std_scale=args.gaussian_std_scale,
-        )
+        if use_online_attribution:
+            _, final_interaction_stats = update_train_offline_stats(
+                model=model,
+                dataset=inner_score_stats_ds,
+                device=device,
+                baselines=baselines,
+                replacement_strategy=args.replacement_strategy,
+                gaussian_std_scale=args.gaussian_std_scale,
+            )
+        else:
+            final_interaction_stats = inactive_attribution_stats(model)[1]
         baseline_summary.to_csv(
             fold_dir / "replacement_baseline_summary.csv", index=False, encoding="utf-8-sig"
         )
@@ -1607,6 +1662,47 @@ def run_fold(
             f"train={len(inner_train_ds)}, validation={len(inner_val_ds)}, test={len(val_ds)}; "
             f"final weights={final_weight_source.upper()}; no outer retrain."
         )
+
+    # Pairwise-interaction analysis is a separate post-hoc workflow. Keep one
+    # baseline artifact matched to the final checkpoint, without running LOO
+    # statistics during student-router training.
+    if not baselines:
+        final_baseline_ds = (
+            baseline_ds
+            if args.training_protocol == "nested_refit"
+            else inner_baseline_ds
+        )
+        baselines, baseline_summary = build_replacement_baselines(
+            model,
+            final_baseline_ds,
+            device,
+        )
+    final_baseline_payload = {
+        "fold": int(fold),
+        "baselines": {
+            name: {
+                key: value.detach().cpu() if torch.is_tensor(value) else value
+                for key, value in stats.items()
+            }
+            for name, stats in baselines.items()
+        },
+        "input_dims": input_dims,
+        "encoder_names": model.encoder_names,
+        "weight_source": final_weight_source,
+        "policy": (
+            "Train-only replacement baselines retained for post-hoc interaction analysis; "
+            "not used by student routing."
+            if use_teacher_student
+            else "Train-only replacement baselines matched to the final online-attribution model."
+        ),
+        "routing_score_stats": model.router.get_score_stats(),
+    }
+    torch.save(final_baseline_payload, fold_dir / "replacement_baselines.pt")
+    baseline_summary.to_csv(
+        fold_dir / "replacement_baseline_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     decision_threshold = float(args.threshold)
     print(f"Fold {fold}: fixed decision threshold={decision_threshold:.6f}")
@@ -1678,7 +1774,9 @@ def run_fold(
                 "ema_start_epoch": int(args.ema_start_epoch),
                 "ema_num_updates": int(final_ema_num_updates),
                 "selected_inner_epoch": int(selected_epoch),
-                "offline_statistics_rebuilt_after_ema": final_weight_source == "ema",
+                "offline_statistics_rebuilt_after_ema": (
+                    use_online_attribution and final_weight_source == "ema"
+                ),
             },
             f,
             indent=2,

@@ -216,7 +216,10 @@ def parse_args() -> argparse.Namespace:
         "--teacher-distill-weight",
         type=float,
         default=0.5,
-        help="KL loss weight matching student router weights to frozen teacher attribution.",
+        help=(
+            "KL loss weight matching student router weights to frozen teacher attribution. "
+            "Set to 0 to skip teacher-target/LOO construction and KL lookup."
+        ),
     )
     parser.add_argument(
         "--teacher-kl-loss-ratio",
