@@ -1,0 +1,64 @@
+model_num,method,auc,std
+2,concat,0.84,0.11
+2,cross attention,0.82,0.11
+2,gated,0.75,0.18
+2,mean fusion,0.82,0.13
+2,self attention,0.84,0.13
+2,static global weight,0.82,0.13
+2,Ours,0.85,0.11
+3,concat,0.75,0.18
+3,cross attention,0.88,0.06
+3,gated,0.80,0.13
+3,mean fusion,0.88,0.07
+3,self attention,0.81,0.17
+3,static global weight,0.87,0.08
+3,Ours,0.86,0.08
+4,concat,0.71,0.18
+4,cross attention,0.83,0.12
+4,gated,0.84,0.09
+4,mean fusion,0.81,0.12
+4,self attention,0.84,0.06
+4,static global weight,0.81,0.12
+4,Ours,0.83,0.12
+5,concat,0.76,0.14
+5,cross attention,0.89,0.07
+5,gated,0.74,0.25
+5,mean fusion,0.77,0.17
+5,self attention,0.80,0.09
+5,static global weight,0.77,0.17
+5,Ours,0.82,0.10
+6,concat,0.79,0.06
+6,cross attention,0.83,0.07
+6,gated,0.82,0.13
+6,mean fusion,0.83,0.11
+6,self attention,0.65,0.19
+6,static global weight,0.83,0.11
+6,Ours,0.82,0.11
+7,concat,0.84,0.09
+7,cross attention,0.87,0.08
+7,gated,0.83,0.11
+7,mean fusion,0.83,0.11
+7,self attention,0.85,0.10
+7,static global weight,0.83,0.11
+7,Ours,0.84,0.09
+8,concat,0.83,0.07
+8,cross attention,0.79,0.12
+8,gated,0.86,0.09
+8,mean fusion,0.85,0.09
+8,self attention,0.74,0.11
+8,static global weight,0.85,0.10
+8,Ours,0.85,0.09
+9,concat,0.81,0.10
+9,cross attention,0.84,0.10
+9,gated,0.83,0.12
+9,mean fusion,0.81,0.12
+9,self attention,0.76,0.09
+9,static global weight,0.81,0.12
+9,Ours,0.83,0.13
+10,concat,0.86,0.08
+10,cross attention,0.82,0.11
+10,gated,0.83,0.13
+10,mean fusion,0.82,0.12
+10,self attention,0.75,0.07
+10,static global weight,0.82,0.12
+10,Ours,0.83,0.11
