@@ -1,0 +1,114 @@
+\section{Diagnosing Foundation-Model Relationships for Fusion}
+To understand why different foundation-model combinations lead to different fusion outcomes, we analyze encoder relationships at three complementary levels: global representation geometry, feature-wise statistical association, and task-conditioned encoder contribution and pairwise interaction.
+We further examine how these relationships translate into fusion performance as the size and composition of the encoder set vary.
+\subsection{Representation Geometry Reveals Structured Model Families}
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_fm/PCA of Foundation-Model CKA Similarity.pdf}
+    \caption{PCA of foundation-model CKA similarity}
+    \label{fig:pca_fm}
+\end{figure}
+We first investigate whether pathology foundation models occupy a homogeneous representation space.
+To characterize representation-level relationships among pathology foundation models, we compute coordinate-aligned linear CKA between every pair of encoders and aggregate the resulting similarity matrices across slides Fig.\ref{fig:pca_fm}.
+Each foundation model is represented by its CKA similarity profile with respect to all other models, and these profiles are subsequently projected into a low-dimensional space using PCA.
+
+Each foundation model is represented by its CKA similarity profile with respect to all other models and projected into a two-dimensional space using PCA. The first two principal components explain 73.3\% of the profile variance.
+The resulting projection reveals a structured representation
+geometry rather than a homogeneous embedding space.
+Importantly, the representation groups are obtained by average-linkage hierarchical clustering using \(1-\overline{\mathrm{CKA}}\), while PCA is used only for visualization.
+The complete CKA heatmap and dendrogram are provided in
+(Appendix Fig.~\ref{fig:cka_heatmap}) and (Appendix Fig.~\ref{fig:cka_clustering}).
+The projected similarity landscape reveals that foundation models are organized into multiple CKA-defined representation families: some models form compact groups with highly similar representation profiles, whereas others exhibit more distinct and isolated positions.
+The complete CKA heatmap and hierarchical dendrogram provide consistent evidence for these representation organizations, indicating that foundation models exhibit different representation geometries rather than a homogeneous embedding space.
+The CKA/PCA analysis uses all 13 available foundation models to characterize the global representation geometry, whereas the subsequent Spearman and task-driven analyses use the representative five-encoder fusion setting used in the downstream experiments.
+Notably, membership in the same representation family indicates similarity in representation geometry, but does not necessarily imply redundant or complementary task information or equivalent downstream contribution.
+In this five-encoder setting, the weak and non-significant association suggests that CKA and feature-wise statistical correspondence capture different aspects of encoder relationships.
+Thus, CKA should not be treated as a complete proxy for feature-wise alignment.
+
+To assess whether global representation similarity corresponds to feature-level statistical association, we compute cross-feature Spearman correlations between each pair of foundation models using coordinate-aligned patches.
+Let \(\mathbf{X}_{i}^{(s)}\in\mathbb{R}^{P_s\times d_i}\) denote the embedding matrix produced by encoder \(i\) for slide \(s\), where \(P_s\) is the number of aligned patches and \(d_i\) is the embedding dimension.
+For the \(a\)-th feature of encoder \(i\) and the \(b\)-th feature of encoder \(j\), we calculate the Spearman rank correlation across aligned patches as
+\begin{equation}
+   \mathbf{x}^{(s)}_{i,a} = \mathbf{X}^{(s)}_{i}[:,a]
+\end{equation}
+\begin{equation}
+    \rho_{ijab}^{(s)}
+    =
+    \operatorname{corr}
+    \left(
+    \operatorname{rank}\big(\mathbf{x}^{(s)}_{i,a}\big),
+    \operatorname{rank}\big(\mathbf{x}^{(s)}_{j,b}\big)
+    \right)
+\end{equation}
+Each encoder pair produces \(d_i d_j\) cross-feature correlations for a given slide. We summarize the feature-level statistical association of encoder pair \((i,j)\) by averaging the absolute correlations over all feature pairs and slides:
+\begin{equation}
+    R_{ij}
+    =
+    \frac{1}{N}
+    \sum_{s=1}^{N}
+    \left[
+    \frac{1}{d_i d_j}
+    \sum_{a=1}^{d_i}
+    \sum_{b=1}^{d_j}
+    \left|\rho_{ijab}^{(s)}\right|
+    \right]
+\end{equation}
+The absolute value measures the strength of monotonic association regardless of correlation direction.
+Finally, to examine whether CKA-based representation similarity is consistent with feature-level statistical association, let \(\overline{C}_{ij}\) denote the slide-averaged Linear CKA between encoders \(i\) and \(j\), and let \(R_{ij}\) denote their mean absolute feature-level Spearman correspondence.
+We collect all unique encoder pairs from the upper-triangular part of the pairwise matrices (\(i<j\)) and compute
+\begin{equation}
+    \rho_{\mathrm{CKA\text{-}FS}}
+    =
+    \operatorname{Spearman}
+    \left(
+    \left\{\overline{C}_{ij}\right\}_{i<j},
+    \left\{R_{ij}\right\}_{i<j}
+    \right)
+\end{equation}
+This statistic measures the rank-order consistency between global representation similarity and feature-wise statistical correspondence.
+We perform this analysis on the representative five-encoder fusion setting used in downstream experiments, which contains ten unique encoder pairs, we observe no significant monotonic association between mean Linear CKA and mean absolute feature-level Spearman correspondence (\(\rho_{\mathrm{CKA\text{-}FS}}=-0.309\), \(p=0.385\)).
+Therefore, CKA alone may not fully characterize the relationships among foundation-model representations.
+
+\subsection{Fusion Performance Depends on Representation Composition}
+Although foundation models exhibit structured representation relationships, it remains unclear whether increasing the number of integrated encoders improves downstream performance.
+We hypothesize that fusion effectiveness depends not only on the number of integrated encoders, but also on the composition and interaction characteristics of the representation pool.
+To investigate this hypothesis, we perform encoder scaling experiments on TCGA-UVM\citep{uvmdataset} using D3 and M3 subtype\citep{fouruvm} classification as the downstream task.
+Six baseline fusion methods and our CoR-Fuse are evaluated under progressively expanded encoder sets.
+The results (Appendix Fig.\ref{fig:scaling_law}) show that fusion performance exhibits non-monotonic and method-dependent scaling with the number of integrated encoders.
+Adding an encoder can improve performance under one representation composition but provide limited benefit or even reduce performance under another. 
+Therefore, the number of integrated encoders alone is insufficient to explain fusion performance; the effect of an additional encoder depends on the composition of the model set and the relationships among the included representations.
+Therefore, effective multi-foundation-model fusion requires understanding encoder relationships beyond model quantity.
+
+\subsection{Sample-specific Encoder Contributions Motivates Adaptive Routing}
+While representation-level and feature-level relationships characterize encoder similarities, they cannot directly reveal whether an individual encoder contributes useful information for downstream tasks.
+Therefore, we further perform task-driven analysis to quantify encoder-specific contribution and investigate whether encoder importance varies across slides.
+To quantify the contribution of each foundation model, we adopt a leave-one-encoder-out (LOO) attribution strategy.
+For a trained reference classifier using the complete encoder set \(\mathcal{E}\), let \(f_y(\mathcal{E}(x))\) denote the target-class one-vs-rest logit margin for slide \(x\). 
+For encoder \(m\), its LOO contribution is defined as:
+\begin{equation}
+    C_m^{\mathrm{LOO}}(x)
+    =
+    f_y\big(\mathcal{E}(x)\big)
+    -
+    f_y\big(\mathcal{E}_{\setminus m}(x)\big),
+\end{equation}
+where \(\mathcal{E}_{\setminus m}(x)\) denotes the encoder set in which the embedding of encoder \(m\) is replaced by a predefined baseline.
+The LOO analysis reveals substantial slide-level variation in encoder contribution (Appendix Fig.\ref{fig:attribution_distribution}).
+Different slides exhibit different top-contributing foundation models, indicating that no single encoder consistently dominates across samples.
+To further investigate whether encoder pairs exhibit non-additive interactions, we extend the analysis to pairwise task-level interaction.
+For a pair of encoders $(i,j)$, we define the pairwise interaction attribution as:
+\begin{equation}
+    I_{ij}(x)
+    =
+    f(\mathcal{E}(x))
+    -
+    f(\mathcal{E}_{\setminus i}(x))
+    -
+    f(\mathcal{E}_{\setminus j}(x))
+    +
+    f(\mathcal{E}_{\setminus \{i,j\}}(x))
+\end{equation}
+This inclusion--exclusion score quantifies the non-additive task-specific interaction between two encoders, where positive and negative values indicate synergistic and interfering effects, respectively.
+The interaction analysis reveals that representation similarity and task-level collaboration are partially decoupled (Appendix Fig.\ref{fig:n5_high_redundancy_quadrants}).
+For example, H-optimus0 and H-optimus1 exhibit high CKA similarity while maintaining substantial pairwise interaction, suggesting that similar representation geometries can still provide additional task-relevant evidence.
+Therefore, representation similarity alone is insufficient to characterize encoder redundancy, motivating adaptive routing that considers sample-specific encoder utility.

@@ -1,8 +1,7 @@
 \section{Conclusion}
-In this paper, we propose [Method Name], an interpretable plug-and-play representation fusion module that decomposes foundation model fusion into individual contribution estimation and pairwise relationship modeling.
-Specifically, we first employ intervention-based attribution to quantify the sample-specific contribution of each foundation model representation.
-We then extend the intervention paradigm to pairwise intervention attribution and introduce pairwise interaction attribution (PIA) to characterize cross-model relationships.
-Finally, we leverage these relational estimates to construct an interaction-aware joint representation, enabling the fused embedding to capture cross-model relational information.
-Additionally, we develop a semantic prior-guided module that incorporates global semantic references to stabilize contribution estimation and improve robustness.
-Experiments and ablation studies on [datasets] datasets demonstrate that our method achieves competitive performance compared with existing fusion strategies.
-In the future, we will investigate more scalable relational modeling strategies for large-scale foundation model collections and explore whether the discovered cross-model relationships can provide further insights into foundation model specialization.
+In this work, we reveal that multi-foundation-model fusion not be viewed as a simple model-scaling problem. 
+The usefulness of an encoder depends on the representation composition in which it is used, while similarity between representations alone does not reliably indicate redundancy or task-level utility. 
+Our analyses also show that the relative contribution of foundation models can vary substantially across slides, suggesting that a single universal fusion strategy is insufficient for heterogeneous pathology representations. 
+We propose CoR-Fuse, a consensus-aware routing fusion framework that estimates sample-specific encoder weights from encoder-specific slide descriptors and cross-encoder consensus representations.
+Overall understanding representation composition and adapting encoder contributions are more important for scalable foundation-model integration than simply increasing the number of participating models.
+Future work will evaluate CoR-Fuse on broader multi-center cohorts and domain-shift scenarios, and explore adaptive routing under dynamic foundation-model availability.

@@ -1,0 +1,20 @@
+\section{Related Work}
+Beyond developing individual foundation models, recent studies have increasingly focused on benchmarking and comparing the representation capability of different pathology FMs.
+These efforts typically evaluate foundation models based on downstream predictive performance, transferability across datasets, and robustness under different clinical tasks \citep{lei2026validation, boutaj2026from, vanderbilt2026goldmark}.
+
+With the emergence of multiple pathology FMs, recent works have explored strategies for integrating heterogeneous representations to improve downstream performance.
+A straightforward approach is representation concatenation or averaging, where features from multiple encoders are aggregated before prediction. 
+These approaches implicitly assume that different encoders provide complementary information or that downstream classifiers can effectively extract task-relevant signals from the aggregated representations.
+
+More recent methods introduce learnable fusion mechanisms, including gated fusion and attention-based aggregation, to adaptively adjust the contribution of different representations.
+For example, Meta-Encoder proposed a unified framework for integrating multiple pathology foundation models and systematically evaluated different fusion strategies across cancer detection tasks \citep{gao2026metaencoder}.
+Other studies explored adaptive integration through logit-level fusion \citep{huang2026plugandplay}, prompt-guided fusion \citep{xiao2025adafusion}, group-based encoder selection \citep{quan2025gas}, and ensemble learning frameworks for precision oncology \citep{luo2025elf}.
+Recent works such as Shazam and FuseCPath further investigated unified integration of multiple foundation models under heterogeneous pathology settings \citep{lei2026shazam, yang2025fusecpath}.
+
+Recent studies also have started exploring MoE-style architectures in computational pathology. Liu et al. proposed a multimodal mixture-of-experts framework that integrates pathology foundation models for immune biomarker prediction, demonstrating the potential of expert specialization for precision oncology \citep{liu2026predicting}.
+Tian et al. introduced region-graph optimal transport routing for MoE-based whole-slide image classification, leveraging structured routing strategies to select informative experts or regions during prediction\citep{tian2026regiongraph}.
+
+Meanwhile, understanding relationships among learned representations has been widely studied in machine learning.
+Representation similarity analysis methods, such as centered kernel alignment (CKA)\citep{cka}, have been used to quantify similarities between neural networks and characterize whether different models learn similar feature spaces.
+Recent studies have extended such analyses to computational pathology foundation models, revealing heterogeneous representation structures across different encoders \citep{mishra2025comparing}.
+However, existing representation analyses mainly characterize similarity patterns, while how representation composition influences multi-foundation-model fusion behavior remains largely unexplored.

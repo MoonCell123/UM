@@ -1,2 +1,86 @@
-\section{Methdology}
-eth
+\section{CoR-Fuse: Consensus-aware Routing Fusion}
+\subsection{Problem Formulation}
+For each slide \(n\), we denote the patch-level representation extracted by foundation model \(m\) as:
+\begin{equation}
+\mathbf{X}_m^{(n)}
+=
+[
+\mathbf{x}_{m,1}^{(n)},
+\ldots,
+\mathbf{x}_{m,P_n}^{(n)}
+]^\top
+\in
+\mathbb{R}^{P_n\times d_m},
+\end{equation}
+where \(P_n\) denotes the number of patches in slide \(n\), and \(d_m\) is the embedding dimension of encoder \(m\).
+All encoders operate on coordinate-aligned patches extracted from the same WSI, enabling patch-level correspondence across heterogeneous representations.
+Given a set of \(M\) foundation models \(\mathcal{E}=\{\mathbf{X}_1,\ldots,\mathbf{X}_M\}\), our goal is to learn a slide-level predictor:
+\begin{equation}
+p_\theta
+(y^{(n)}
+|
+\mathbf{X}_1^{(n)},...,\mathbf{X}_M^{(n)})
+\end{equation}
+The routing weights determine the contribution of each foundation model when constructing the fused patch representation.
+This formulation addresses two challenges in multi-foundation-model fusion: (1) different encoders have different embedding dimensions and representation geometries; and (2) the task relevance of an encoder may vary across slides.
+Consequently, fixed aggregation strategies that assume uniform or globally stable encoder contributions may be suboptimal.
+The following sections describe the unified representation space, consensus construction, and consensus-guided adaptive routing mechanism.
+\subsection{Unified Representation Space and Consensus Construction}
+Since pathology foundation models produce representations with different embedding dimensions, we first project all embeddings into a shared latent space:
+\begin{equation}
+    \mathbf{H}_{m}^{(n)}
+    =
+    P_m(\mathbf{X}_{m}^{(n)})
+    \in
+    \mathbb{R}^{P_n\times 512},
+\end{equation}
+where \(P_m(\cdot)\) denotes an encoder-specific projection head that outputs into a shared 512-dimensional latent space.
+For each encoder, we aggregate its projected patch embeddings into a slide-level descriptor \(\boldsymbol{\mu}_{m}^{(n)}\).
+We then construct a consensus representation as:
+\begin{equation}
+\boldsymbol{\mu}_{con}^{(n)}
+=
+\frac{1}{M}
+\sum_{m=1}^{M}
+\boldsymbol{\mu}_{m}^{(n)}
+\in
+\mathbb{R}^{512}
+\end{equation}
+The consensus representation serves as a slide-level reference summarizing the overall semantic tendency of the representation pool.
+For each encoder, we concatenate its individual representation with the consensus reference.
+These encoder-conditioned representations are subsequently used by the adaptive router to estimate slide-dependent routing scores.
+\subsection{Two-Stage Optimization for Adaptive Routing}
+To stabilize adaptive multi-encoder fusion, we adopt a two-stage optimization strategy consisting of mean-fusion warm initialization and consensus-guided adaptive routing.
+\subsubsection{Stage 1: Stable Mean-Fusion Initialization}
+We first train a reference fusion model using uniform mean fusion.
+The fused patch representations are subsequently aggregated by an MIL classifier to produce slide-level predictions.
+The reference model is optimized by the training loss function:
+\begin{equation}
+    \mathcal{L}_{T}=CE(o^T(x),y)
+\end{equation}
+The best-performing mean-fusion model on the validation set is selected and frozen.
+At the end of warm-start stage, the projection heads and MIL classifier are transferred to initialize the adaptive fusion model.
+\subsubsection{Stage 2: Consensus-Guided Adaptive Routing}
+Given the initialized shared representation space, we introduce a lightweight encoder-level router to estimate slide-specific fusion weights.
+For each slide, the router summarizes each encoder representation into a slide-level descriptor through mean pooling over patches.
+Importantly, this pooling operation is only used for routing and does not replace the patch-level representations used by the downstream MIL classifier.
+A consensus descriptor is constructed from all encoder representations and serves as a global reference of the representation pool.
+Each encoder descriptor is combined with the consensus representation and fed into a lightweight MLP router:
+\begin{equation}
+    s_m(x)=
+    \mathrm{MLP}
+    ([\mu_m(x),\bar{\mu}(x)])
+    +b_m,
+\end{equation}
+where \(b_m\) is a learnable encoder-specific bias capturing global preference of each foundation model.
+The routing scores are converted into normalized weights through softmax, and the final fused patch representation is obtained as:
+\begin{equation}
+    Z_p(x)=
+    \sum_{m=1}^{M}w_m(x)H_{m,p}(x)
+\end{equation}
+The router and fusion model are optimized jointly using only the downstream classification objective.
+Unlike distillation-based routing approaches, our method does not require additional teacher-student matching objectives or attribution supervision.
+\subsection{Fusion Prediction}
+The routing weights are applied to the patch-level representations from all foundation models to construct the fused patch bag.
+The fused representations are subsequently processed by an ABMIL classifier\citep{ilse2018abmil}, which performs patch-level attention aggregation and generates slide-level predictions.
+The entire CoR-Fuse framework is optimized with the same downstream classification objective.

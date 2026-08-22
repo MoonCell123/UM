@@ -1,2 +1,44 @@
 \section{Introduction}
-eth
+The rapid development of pathology foundation models(FMs) has advanced computational pathology by learning robust histological representations from large-scale whole-slide image (WSI) datasets, enabling efficient adaptation to diverse clinical diagnostic tasks\citep{conchv1andconchv15,gigapath,hibou,hoptimus0,hoptimus1,midnight12k,phikon,phikonv2,univ1anduniv2,virchow,virchow2}.
+Unlike conventional task-specific models trained on limited disease-specific data, foundation models represent different design paradigms, including vision-only self-supervised learning and vision-language contrastive learning, with heterogeneous pretraining corpora, network architectures, and optimization objectives.
+
+Nevertheless, no single pathology foundation model universally dominates all clinical diagnostic tasks\citep{boutaj2026from,vanderbilt2026goldmark}.
+This limitation introduced a critical challenge: how to effectively integrate multiple foundation model representations.
+In practice, different foundation models capture divergent yet partially overlapping histological patterns, offering independent feature views of WSI data.
+Simply aggregating more models or adopting naive fusion strategies cannot necessarily guarantee consistent performance improvement.
+
+Existing fusion approaches, including feature concatenation, attention-based method\citep{vaswani2017attention}, mixture-of-experts (MoE) routing\citep{shazeer2017moe}, typically adopt fixed aggregation pipelines for foundation model integration.
+These methods primarily evaluate fixed combinations of foundation models and focus on downstream predictive performance, implicitly assuming that fusion effectiveness is mainly determined by the classification task, the underlying relationships among foundation model representations remain largely unexplored.
+In particular, it remains unclear how representation similarity, feature-level correspondence, and task-specific contribution influence fusion behavior, and under what conditions complex interaction-based fusion methods such as attention can outperform simpler aggregation strategies.
+Therefore, it introduces another challenge: understanding and analyzing the inherent structure and relationship of foundation model representations becomes increasingly important for developing reliable multi-foundation-model integration frameworks.
+
+In this work, we argue that multi-foundation-model fusion should be formulated as a model-specific contribution estimation problem, rather than a static feature aggregation problem.
+Each foundation model may contribute useful information, but its relative contribution can vary across models and samples.
+To address all mentioned above challenges, we propose a three-level evaluation framework to evaluate the relationship between foundation model representations.
+First, we adopt centered kernel alignment(CKA)\citep{cka} to quantify geometric similarities across representations from representation-level;
+Second, we employ Spearman's rank correlation\citep{spearman} to measure feature alignment from feature-level;
+Third, we leverage leave-one-out perturbation attribution\citep{loo} and second-order pairwise interaction\citep{interaction} to calculate each representations their own attribution and interaction from task-level.
+
+Through systematic analyses based on this three-level framework, we derive several insightful observations:
+1. Fusion effectiveness depends on foundation-model composition rather than the number of integrated models alone.
+2. High representation similarity does not imply fusion redundancy.
+3. Foundation models exhibit structured representation families.
+4. No single fusion strategy universally dominates, the suitability of strategy is conditioned on the composition of integrated representations.
+5. Per-model marginal contribution is sample-dependent, varying significantly across slides.
+
+Driven by these key insights, we further devise a consensus-aware routing fusion method(CoR-Fuse), a plug-and-play, task-adaptive two-stage routing optimization module. CoR-Fuse constructs a fused representaion for downstream network no matter multiple instance learning(MIL)\citep{ilse2018abmil},graph neural network (GNN)\citep{gnn} or MLP architectures.
+We extensively evaluate CoR-Fuse across multiple TCGA cohorts\citep{tcga}, examine performance scaling with the increasing number of integrated foundation models, representation similarity, contribution patterns, cross-model interactions, and computational efficiency.
+Experimental results demonstrate that our method achieves the balance between interpretability and efficiency, and competitive performance compared with existing fusion strategies.
+
+Our main contributions are summarized as follows:
+
+\begin{itemize}
+
+\item We identify the model-specific contribution problem in multi-foundation-model fusion: although each foundation model contributes information to the fused representation, the magnitude of its contribution varies across models and samples, making uniform aggregation suboptimal.
+
+\item We propose a three-level representation evaluation framework that analyzes foundation model embeddings in terms of representation geometry, pairwise feature alignment, and task-level contribution and interaction.
+
+\item We introduce CoR-Fuse, which uses mean pooled representation across foundation models as a slide-specific consensus reference, and estimates each model's routing score conditioned on both its own representation and this shared reference.
+
+\item Extensive experiments demonstrate that CoR-Fuse substantially reducing FLOPs and inference latency relative to attention-based fusion methods.
+\end{itemize}
