@@ -1,2 +1,103 @@
 \section{Experiments}
-eth
+\subsection{Experimental Setup}
+\textbf{Datasets.}
+To evaluate multi-foundation-model fusion under different downstream tasks, we conduct experiments on two TCGA cohorts, including TCGA-UVM\citep{uvmdataset} and TCGA-BLCA\citep{blcatp53mutation}.
+We use 80 WSIs from TCGA-UVM as the primary benchmark.
+Following previous molecular characterization studies, we formulate the task as D3/M3 subtype binary classification\citep{fouruvm}, with 38 D3 cases and 42 M3 cases.
+We further evaluate our approach on TCGA-BLCA, consisting of 455 WSIs. 
+The task is formulated as binary prediction of TP53 mutation status from WSI representations, distinguishing TP53-mutant and TP53-wildtype cases\citep{blcatp53mutation}, with 238 mutant and 219 wildtype cases.
+
+\textbf{Implementation Details.}
+For both TCGA-UVM and TCGA-BLCA datasets, we perform patient-level stratified five-fold cross-validation and report the average performance across five folds. 
+All foundation-model embeddings are extracted using the same preprocessing pipeline.
+Performance is evaluated using the area under the receiver operating characteristic curve (AUC) and the area under the precision-recall curve (AUPRC). Computational efficiency is compared in terms of the number of parameters and floating-point operations (FLOPs).
+Detailed training configurations and hyperparameter settings are provided in the supplementary materials.
+\subsection{Experimental Results}
+\subsubsection{Multi-Foundation-Model Fusion under Different Representation Compositions}
+\textbf{Individual Foundation Model Performance.}
+We first evaluate all 13 FMs on TCGA-UVM (Appendix Table \ref{tab:uvm_all_fm_performance}.), orderd by AUC and the results are reported as mean standard deviation over five folds.
+The individual performance varies substantially across foundation models, suggesting that different encoders provide different levels of task relevance and motivating representation-aware fusion.
+
+\textbf{Comparison with Existing Fusion Strategies.}
+Based on the above analysis, we hypothesize that fusion effectiveness depends on the composition of integrated representations rather than the number of encoders alone.
+Therefore, we evaluate representative fusion strategies under different foundation-model compositions.
+We compare representative fusion paradigms, including concatenation, mean fusion, static global weighting, gated fusion and attention-based fusion.
+Mean fusion assigns equal weights to all encoders, while static global weighting learns a shared encoder-level weighting scheme across all slides.
+Gated fusion uses a shared linear gate maps each descriptor to a scalar score, which is transformed by a sigmoid function and normalized across encoders.
+We fix the number of integrated foundation models to five and construct several representative encoder sets with different representation characteristics based on the CKA analysis in Fig.\ref{fig:pca_fm}.
+
+The first composition contains highly aligned representations: \{H-optimus-0, H-optimus-1, UNI, GigaPath, Phikon-v2\}.
+In this setting (Appendix Table \ref{tab:uvm_high_similarity}.), attention-based method achieve better performance than simple aggregation strategies.
+The second composition contains more heterogeneous representations: \{Hibou-L, Virchow2, CONCH-v1.5, UNI-v2, H-optimus-0\}.
+Interestingly, simple fusion strategies outperform attention-based methods in this setting (Appendix Table \ref{tab:uvm_high_diversity}.), suggesting that more complex interaction modeling does not always improve fusion performance.
+Finally, we evaluate a representative composition combining diverse representation characteristics: \{H-optimus-1, H-optimus-0, Virchow2, UNI-v2, CONCH-v1.5\}.
+As shown in Table \ref{tab:uvm_n5_balanced_group}, CoR-Fuse achieves strong and stable performance across this representative composition.
+Overall, these results demonstrate that fusion behavior is conditioned on representation composition, and adaptive encoder routing provides a robust strategy across different foundation-model combinations.
+
+\begin{table}[t]
+\centering
+\caption{Fusion performance under a representative five-encoder composition on TCGA-UVM.
+Params and FLOPs denote parameters (M) and computational cost (G), respectively.}
+\label{tab:uvm_n5_balanced_group}
+\begin{tabular}{lccccc}
+\toprule
+Method & AUC & AUPRC & F1 & Params & FLOPs\\
+\midrule
+Mean Fusion & $0.84 \pm 0.10$ & $0.88 \pm 0.09$ & $0.73 \pm 0.15$ &$\mathbf{4.27}$ &$\mathbf{47.47 \pm 3.79}$\\
+Concatenation & $0.80 \pm 0.08$ & $0.86 \pm 0.04$ & $0.71 \pm 0.10$ &$5.58$ &$62.06 \pm 4.95$\\
+Static Weight & $0.84 \pm 0.10$ & $0.88 \pm 0.09$ & $0.73 \pm 0.15$ &$\mathbf{4.27}$ &$\mathbf{47.47 \pm 3.79}$\\
+Gated Fusion & $\mathbf{0.85 \pm 0.08}$ & $\mathbf{0.89 \pm 0.07}$ & $0.78 \pm 0.13$ &$\mathbf{4.27}$ &$\mathbf{47.47 \pm 3.79}$\\
+Cross Attention & $0.82 \pm 0.10$ & $0.86 \pm 0.09$ & $0.74 \pm 0.07$ &$6.37$ &$94.40 \pm 7.53$\\
+Self Attention & $0.83 \pm 0.07$ & $0.88 \pm 0.08$ & $0.73 \pm 0.11$ &$7.68$ &$178.82 \pm 14.28$\\
+CoR-Fuse & $0.85 \pm 0.10$ & $0.88 \pm 0.10$ & $\mathbf{0.79 \pm 0.13}$ &$4.43$ &$\mathbf{47.47 \pm 3.79}$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Fusion Performance with Different Foundation Model Set Sizes.}
+We systematically evaluate different fusion strategies under varying foundation-model set sizes.
+Specifically, we gradually increase the number of integrated foundation models from two to ten and evaluate six fusion strategies and CoR-Fuse.
+The results in Appendix Fig. \ref{fig:scaling_law} show that increasing the number of integrated foundation models does not consistently improve fusion performance, and the benefit of additional encoders varies substantially across fusion strategies.
+Additional encoders may introduce redundant representations or limited task-relevant information, resulting in marginal gains or performance degradation.
+In contrast, CoR-Fuse maintains comparatively stable performance as the number of integrated foundation models varies, suggesting greater robustness to changes in encoder set size.
+
+\subsubsection{Cross-Cohort Evaluation}
+To simulate practical deployment scenarios where users integrate a limited yet diverse set of available foundation models, we select five representative pathology foundation models spanning different architectures, pretraining strategies, and model scales: \{UNI, Virchow2, Midnight-12K, GigaPath, Phikon\}.
+
+
+\subsection{Ablation Study}
+To understand the contribution of the main design choices in CoR-Fuse, we conduct ablation studies on TCGA-UVM under the representative five-encoder composition.
+Table \ref{tab:ablation} shows the result of validating each module, it suggests that sample-specific routing provides a more stable integration mechanism than fixed or globally shared fusion strategies, although its benefit remains dependent on the underlying representation composition.
+
+\textbf{Effect of Adaptive Routing.}
+Compared with uniform mean fusion, removing adaptive routing indicating that treating all encoders equally is insufficient when their representation quality and task relevance vary across slides.
+
+\textbf{Global versus Sample-Specific Routing.}
+To distinguish sample-specific routing from simply learning a fixed encoder preference, we further compare with a static global-weight baseline. 
+The static global-weight baseline obtains the same AUC as uniform mean fusion.
+As shown in (Appendix Table \ref{tab:static_global_weights}) its learned weights deviate only slightly from uniform weighting, which explains why these small changes do not alter the sample ranking underlying AUC.
+
+\textbf{Effect of Consensus Representation.}
+Without the consensus signal, the router must estimate encoder importance independently for each encoder, lacking access to the relative position of an encoder representation with respect to the group-level representation.
+This variant leads to lower ranking-based performance than the full model, demonstrating that the consensus representation provides complementary relational context for estimating encoder contributions. 
+
+\textbf{Effect of Task-Driven Warm Start.}
+To evaluate its contribution, we remove the warm-start stage while keeping the routing architecture, data splits, and downstream training budget unchanged.
+These results suggest that the main benefit of warm-start is improved ranking stability rather than a uniform improvement at a fixed decision threshold.
+
+\begin{table}[t]
+\centering
+\caption{Ablation study of CoR-Fuse components on TCGA-UVM.}
+\label{tab:ablation}
+\begin{tabular}{lcccc}
+\toprule
+Method & Warm Start & Consensus & Adaptive Router & AUC \\
+\midrule
+Mean Fusion & \xmark & \xmark & \xmark & $0.80 \pm 0.11$ \\
+Static Weight & \xmark & \xmark & \xmark & $0.80 \pm 0.11$ \\
+w/o Consensus & \cmark & \xmark & \cmark & $0.82 \pm 0.12$ \\
+w/o Warm Start & \xmark & \cmark & \cmark & $0.83 \pm 0.12$ \\
+CoR-Fuse & \cmark & \cmark & \cmark & $\mathbf{0.84 \pm 0.12}$ \\
+\bottomrule
+\end{tabular}
+\end{table}

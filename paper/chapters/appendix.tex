@@ -1,0 +1,181 @@
+\appendix
+\section{AI use statement}
+During the development of this work, we utilized LLMs for grammar correction and occasional text rewriting.
+
+\section{Analysis of Foundation Models in TCGA-UVM}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_fm/foundation_model_cka_heatmap.pdf}
+    \caption{Mean coordinate-aligned linear CKA}
+    \label{fig:cka_heatmap}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_fm/foundation_model_dendrogram.pdf}
+    \caption{Foundation model clustering from 1 - linear CKA}
+    \label{fig:cka_clustering}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_scaling_law/um_scaling_law.pdf}
+    \caption{Fusion performance versus the number of integrated foundation models}
+    \label{fig:scaling_law}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_fm/attribution_distribution.pdf}
+    \caption{LOO attribution distribution}
+    \label{fig:attribution_distribution}
+\end{figure}
+
+\begin{table}[t]
+    \centering
+    \caption{Single foundaiton model performance on TCGA-UVM.}
+    \label{tab:uvm_all_fm_performance}
+    \begin{tabular}{lccc}
+    \toprule
+    Model & AUC & AUPRC & F1 \\
+    \midrule
+    H-optimus-1 &$\mathbf{0.90 \pm 0.11}$ &$\mathbf{0.91 \pm 0.09}$ &$\mathbf{0.82 \pm 0.13}$ \\
+    H-optimus-0 &$0.85 \pm 0.13$ &$0.88 \pm 0.11$ &$0.80 \pm 0.14$ \\
+    Virchow2 &$0.83 \pm 0.12$ &$0.85 \pm 0.14$ &$0.78 \pm 0.11$ \\
+    GigaPath &$0.80 \pm 0.12$ &$0.84 \pm 0.12$ &$0.75 \pm 0.10$ \\
+    UNI &$0.79 \pm 0.13$ &$0.82 \pm 0.14$ &$0.68 \pm 0.20$ \\
+    CONCH &$0.78 \pm 0.14$ &$0.82 \pm 0.15$ &$0.73 \pm 0.17$ \\
+    UNI-v2 &$0.76 \pm 0.24$ &$0.81 \pm 0.19$ &$0.69 \pm 0.18$ \\
+    CONCH-v1.5 &$0.76 \pm 0.16$ &$0.78 \pm 0.17$ &$0.72 \pm 0.19$ \\
+    Phikon &$0.76 \pm 0.21$ &$0.81 \pm 0.18$ &$0.70 \pm 0.16$ \\
+    Phikon-v2 &$0.74 \pm 0.19$ &$0.78 \pm 0.20$ &$0.62 \pm 0.20$ \\
+    Hibou-L &$0.73 \pm 0.17$ &$0.82 \pm 0.13$ &$0.67 \pm 0.12$ \\
+    Virchow &$0.71 \pm 0.15$ &$0.74 \pm 0.14$ &$0.66 \pm 0.11$ \\
+    Midnight-12k &$0.59 \pm 0.25$ &$0.67 \pm 0.20$ &$0.62 \pm 0.15$ \\
+    \bottomrule
+    \end{tabular}
+\end{table}
+
+\section{Experiments on TCGA-UVM}
+\subsection{Experimental Results of Five Diversity-Representation Encoders}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_n5_cka_range_max/cka_abs_interaction_quadrants.pdf}
+    \caption{Five diversity-max encoders interaction quadrants}
+    \label{fig:n5_diversity_max_quadrants}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_n5_cka_range_max/cka_vs_mean_abs_spearman.pdf}
+    \caption{Five diversity-max encoders CKA vs mean Spearman}
+    \label{fig:n5_diversity_max_spearman}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_n5_cka_range_max/gme_routing_weight_distribution.pdf}
+    \caption{Five diversity-max encoders weight distribution}
+    \label{fig:n5_diversity_max_weight}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_n5_cka_range_max/mean_abs_spearman_heatmap.pdf}
+    \caption{Five diversity-max encoders Spearman heatmap}
+    \label{fig:n5_diversity_spearman_heatmap}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Fusion performance under a heterogeneous five-encoder composition.}
+\label{tab:uvm_high_diversity}
+\begin{tabular}{lccc}
+\toprule
+Method & AUC & AUPRC & F1 \\
+\midrule
+Mean Fusion & $0.84 \pm 0.11$ & $0.88 \pm 0.09$ & $0.75 \pm 0.15$ \\
+Concatenation & $0.84 \pm 0.09$ & $0.87 \pm 0.09$ & $0.73 \pm 0.09$ \\
+Static Global Weight & $\mathbf{0.85 \pm 0.11}$ & $\mathbf{0.89 \pm 0.09}$ & $\mathbf{0.78 \pm 0.11}$ \\
+Cross Attention & $0.81 \pm 0.13$ & $0.84 \pm 0.12$ & $0.70 \pm 0.24$ \\
+Self Attention & $0.78 \pm 0.13$ & $0.83 \pm 0.10$ & $0.72 \pm 0.13$ \\
+Gated Fusion & $0.81 \pm 0.13$ & $0.85 \pm 0.11$ & $0.74 \pm 0.16$ \\
+CoR-Fuse & $0.83 \pm 0.11$ & $0.88 \pm 0.10$ & $0.73 \pm 0.15$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Experimental Results of Five High-Similarity Encoders}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_n5_high_redundancy_group/cka_abs_interaction_quadrants.pdf}
+    \caption{Five high-redundancy encoders interaction quadrants}
+    \label{fig:n5_high_redundancy_quadrants}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_n5_high_redundancy_group/cka_vs_mean_abs_spearman.pdf}
+    \caption{Five high-redundancy encoders CKA vs mean Spearman}
+    \label{fig:n5_high_redundancy_spearman}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_n5_high_redundancy_group/gme_routing_weight_distribution.pdf}
+    \caption{Five high-redundancy encoders weight distribution}
+    \label{fig:n5_high_redundancy_weight}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_n5_high_redundancy_group/mean_abs_spearman_heatmap.pdf}
+    \caption{Five high-redundancy encoders Spearman heatmap}
+    \label{fig:n5_high_redundancy_heatmap}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Fusion performance under a high-similarity five-encoder composition.}
+\label{tab:uvm_high_similarity}
+\begin{tabular}{lccc}
+\toprule
+Method & AUC & AUPRC & F1 \\
+\midrule
+Mean Fusion & $0.79 \pm 0.18$ & $0.82 \pm 0.17$ & $0.72 \pm 0.18$ \\
+Concatenation & $0.83 \pm 0.09$ & $0.88 \pm 0.10$ & $0.76 \pm 0.13$ \\
+Static Global Weight & $0.79 \pm 0.18$ & $0.82 \pm 0.17$ & $0.72 \pm 0.18$ \\
+Cross Attention & $\mathbf{0.86 \pm 0.12}$ & $0.88 \pm 0.11$ & $\mathbf{0.81 \pm 0.09}$ \\
+Self Attention & $0.85 \pm 0.11$ & $\mathbf{0.88 \pm 0.08}$ & $0.76 \pm 0.10$ \\
+Gated Fusion & $0.83 \pm 0.15$ & $0.86 \pm 0.12$ & $0.74 \pm 0.16$ \\
+CoR-Fuse & $0.83 \pm 0.11$ & $0.87 \pm 0.11$ & $0.74 \pm 0.17$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Implementation Details}
+All experiments were implemented in Pytorch and run on two NVIDIA GeForce RTX 4090 GPU.
+We conducted with a fixed random seed of 42 for reproducibility. The teacher model was optimized for 20 epochs with a learning rate of \(1\times10^{-4}\). The subsequent fusion stage was trained for 80 epochs with the same learning rate of \(1\times10^{-4}\).
+
+\section{Ablation Study}
+\begin{table}[t]
+\centering
+\caption{Learned static global weights across the five cross-validation folds. 
+Uniform mean fusion assigns a weight of $1/M$ to every encoder.}
+\label{tab:static_global_weights}
+\begin{tabular}{c|ccccc}
+\toprule
+Fold & GigaPath & H-optimus-0 & H-optimus-1 & UNI & Virchow \\
+\midrule
+1 & 0.199106 & 0.201023 & 0.200701 & 0.200004 & 0.199166 \\
+2 & 0.200052 & 0.200357 & 0.200123 & 0.199799 & 0.199669 \\
+3 & 0.199990 & 0.200125 & 0.200462 & 0.200119 & 0.199304 \\
+4 & 0.199703 & 0.200350 & 0.199731 & 0.200081 & 0.200135 \\
+5 & 0.199639 & 0.200982 & 0.200816 & 0.199814 & 0.198749 \\
+\midrule
+\bottomrule
+\end{tabular}
+\end{table}

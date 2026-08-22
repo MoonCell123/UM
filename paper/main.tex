@@ -1,6 +1,12 @@
 \documentclass{article}
 \usepackage{iclr2027_conference,times}
 \usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{pifont}
+\newcommand{\cmark}{\ding{51}}% ✓
+\newcommand{\xmark}{\ding{55}}% ✗
 
 % --- Preamble ---
 \input{preamble/packages}
@@ -17,15 +23,20 @@
 
 % --- Chapters ---
 \input{chapters/introduction}
+\input{chapters/related_work}
+\input{chapters/analysis.tex}
 \input{chapters/method}
 \input{chapters/experiment}
 \input{chapters/conclusion}
 
+%\input{chapters/acknowledgement.tex}
+
 % ---- Bibliography ----
-% BibTeX users should specify bibliography style 'splncs04'.
-% References will then be sorted and formatted in the correct style.
 % \bibliographystyle{splncs04}
 \bibliographystyle{iclr2027_conference}
 \bibliography{refs/refs}
 
+\appendix
+\clearpage
+\input{chapters/appendix.tex}
 \end{document}
