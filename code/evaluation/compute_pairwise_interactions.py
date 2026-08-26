@@ -30,7 +30,7 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 from architecture.gme_model import GMEModel
-from data_utils.cls_dataset import load_uvm_data
+from data_utils.cohort import load_experiment_data, resolve_cohort_spec
 from data_utils.gme_dataset import MultiEncoderSlideDataset
 from train.gme.experiment import build_replacement_baselines, move_features
 
@@ -123,6 +123,12 @@ def build_model(run_config: Mapping[str, object], checkpoint_payload: Mapping[st
         d_attn=int(run_config.get("d_attn", 128)),
         n_classes=int(run_config.get("n_classes", 2)),
         droprate=float(run_config.get("droprate", 0.25)),
+        downstream_head=str(
+            checkpoint_payload.get("downstream_head", run_config.get("downstream_head", "ABMIL"))
+        ),
+        mlp_hidden_dim=int(run_config.get("mlp_hidden_dim", 256)),
+        gnn_hidden_dim=int(run_config.get("gnn_hidden_dim", 256)),
+        gnn_layers=int(run_config.get("gnn_layers", 2)),
         routing_temperature=float(run_config.get("routing_temperature", 0.5)),
         routing_logit_scale=float(run_config.get("routing_logit_scale", 1.0)),
         attribution_target=str(run_config.get("attribution_target", "predicted_class")),
@@ -130,6 +136,7 @@ def build_model(run_config: Mapping[str, object], checkpoint_payload: Mapping[st
             int(run_config.get("student_router_hidden_dim", 0)) if routing_mode == "teacher_student" else 0
         ),
         student_router_temperature=float(run_config.get("student_router_temperature", 1.0)),
+        student_router_use_consensus=bool(run_config.get("student_router_use_consensus", True)),
     ).to(device)
     state_dict = checkpoint_payload.get("state_dict")
     if not isinstance(state_dict, dict):
@@ -166,12 +173,19 @@ def main() -> None:
     if fold is None:
         fold = int(checkpoint.get("fold", 0)) or int(fold_dir.name.rsplit("_", 1)[-1])
     clinical_path = args.clinical_path or run_config.get("clinical_path")
-    label_col = args.label_col or run_config.get("label_col", "d3m3")
+    experiment_name = str(run_config.get("experiment_name", "UVM"))
+    cohort = resolve_cohort_spec(experiment_name)
+    label_col = cohort.label_col
+    if args.label_col is not None and str(args.label_col) != label_col:
+        raise ValueError(
+            f"{cohort.name} uses the fixed label column {label_col!r}; "
+            f"received --label-col={args.label_col!r}."
+        )
     if not clinical_path:
         raise ValueError("Clinical path is required; pass --clinical-path or use a run config containing it.")
-    # Match the training path: the clinical CSV stores ``SCNA Cluster No.``
-    # and load_uvm_data derives the binary ``d3m3`` label used by GME.
-    clinical_df, _, _ = load_uvm_data(str(clinical_path), str(label_col))
+    clinical_df, _, _, loaded_cohort = load_experiment_data(experiment_name, str(clinical_path))
+    if loaded_cohort.name != cohort.name:
+        raise RuntimeError("Resolved cohort does not match the saved experiment configuration.")
     clinical_df["slide_id"] = clinical_df["slide_id"].astype(str)
     manifest = pd.read_csv(args.manifest)
     if fold not in set(manifest["fold"].dropna().astype(int)):

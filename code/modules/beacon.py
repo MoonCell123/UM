@@ -1,9 +1,7 @@
 """Static Beacon construction and similarity scoring for middle-fusion models.
 
-Stage policy:
-    1. Train ProjectionHead with the downstream model.
-    2. Freeze ProjectionHead.
-    3. Use train-split embeddings only to project -> build Beacon -> save .pt.
+This utility loads projection-head weights, freezes them for feature extraction,
+and uses train-split embeddings to build a static Beacon.
 
 The saved Beacon is then used as a static Global Prior for validation/test and
 later model training stages.
@@ -287,7 +285,7 @@ def load_frozen_projection_heads(
     device: str | torch.device = "cpu",
     strict: bool = False,
 ) -> MultiEncoderProjectionHead:
-    """Load Stage-1 ProjectionHead weights and freeze them for Beacon building."""
+    """Load projection-head weights and freeze them for Beacon building."""
     device = torch.device(device)
     projection_heads = MultiEncoderProjectionHead(
         input_dims=input_dims,
@@ -398,7 +396,7 @@ def build_static_beacon_from_checkpoint(
     normalize_beacon: bool = True,
     strict_load: bool = False,
 ) -> Tuple[torch.Tensor, pd.DataFrame, Dict[str, int]]:
-    """Stage-2 helper: load frozen ProjectionHeads and build static Beacon."""
+    """Load frozen projection heads and build a static Beacon."""
     manifest = pd.read_csv(manifest_path)
     input_dims = infer_input_dims(manifest, fold=fold)
     projection_heads = load_frozen_projection_heads(
@@ -442,8 +440,8 @@ def save_beacon(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Stage-2 static Beacon builder. Load a Stage-1 trained ProjectionHead "
-            "checkpoint, freeze projection, project train split, and save Beacon .pt."
+            "Static Beacon builder. Load a projection-head checkpoint, freeze the "
+            "projection, project the train split, and save a Beacon .pt."
         )
     )
     parser.add_argument("--manifest", type=Path, default=Path("output/Middle_Fusion_Manifests/middle_fusion_manifest.csv"))
@@ -469,7 +467,7 @@ def main() -> None:
     manifest = pd.read_csv(args.manifest)
     rows = manifest[(manifest["fold"] == args.fold) & (manifest["split"] == args.split)]
     print("=" * 80)
-    print("Stage-2 static Beacon builder")
+    print("Static Beacon builder")
     print("=" * 80)
     print(f"Manifest: {args.manifest}")
     print(f"fold={args.fold}, split={args.split}")
@@ -480,10 +478,10 @@ def main() -> None:
     if args.projection_checkpoint is None:
         print()
         print("No --projection-checkpoint provided. This run only inspected the manifest.")
-        print("After Stage 1, pass the trained ProjectionHead checkpoint to build Beacon:")
+        print("Pass a trained projection-head checkpoint to build Beacon:")
         print(
             "python code/modules/beacon.py "
-            "--projection-checkpoint path/to/stage1_projection.pt --fold 1"
+            "--projection-checkpoint path/to/gme_checkpoint.pt --fold 1"
         )
         return
 

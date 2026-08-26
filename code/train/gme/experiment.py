@@ -1,9 +1,9 @@
-"""End-to-end GME/CGME middle-fusion training for UVM D3/M3 classification.
+"""End-to-end GME/CGME middle-fusion training for cohort-selected classification.
 
 This script is intentionally self-contained for server runs:
 
 1. Read a middle-fusion manifest of multi-encoder h5 embeddings.
-2. For each CV fold, train ProjectionHead, router, and ABMIL together.
+2. For each CV fold, train ProjectionHead, router, and the configured downstream head together.
 3. Use intervention attribution only when online routing or teacher
    distillation is enabled; otherwise keep it as a separate post-hoc analysis.
 4. Report GME performance, attribution-independent routing, and efficiency.
@@ -25,7 +25,6 @@ import random
 import subprocess
 import sys
 import time
-from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -55,10 +54,9 @@ for path in (PROJECT_ROOT, CODE_DIR, CODE_DIR / "architecture", CODE_DIR / "modu
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from architecture.abmil_cls import ABMIL_Cls
 from architecture.gme_model import GMEModel
 from architecture.projection_head import MultiEncoderProjectionHead
-from data_utils.cls_dataset import load_uvm_data
+from data_utils.cohort import load_experiment_data
 from data_utils.gme_dataset import MultiEncoderSlideDataset, infer_input_dims
 from modules.attribution import EncoderBaselineAccumulator, replace_encoder_embedding
 from modules.routing import DualConsistencyRouter
@@ -75,6 +73,7 @@ DEFAULT_FEATURE_DIRS = [
     "features_hoptimus0",
 ]
 PATH_ARGS = ("manifest", "manifest_dir", "output_dir", "run_dir")
+DEFAULT_DECISION_THRESHOLD = 0.5
 
 
 @dataclass
@@ -90,67 +89,6 @@ class EvalResult:
     fp: int
     fn: int
     tp: int
-
-
-class ExponentialMovingAverage:
-    """Maintain an optimizer-step EMA of model parameters.
-
-    Offline routing statistics are deliberately not averaged. They are rebuilt
-    from train-only data after applying the averaged parameters.
-    """
-
-    def __init__(self, decay: float) -> None:
-        if not 0.0 < float(decay) < 1.0:
-            raise ValueError(f"EMA decay must be between 0 and 1, got {decay}")
-        self.decay = float(decay)
-        self.shadow: Dict[str, torch.Tensor] = {}
-        self.num_updates = 0
-
-    @property
-    def initialized(self) -> bool:
-        return bool(self.shadow)
-
-    @torch.no_grad()
-    def initialize(self, model: nn.Module) -> None:
-        self.shadow = {
-            name: parameter.detach().clone()
-            for name, parameter in model.named_parameters()
-        }
-        self.num_updates = 0
-
-    @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        if not self.initialized:
-            raise RuntimeError("EMA must be initialized before update().")
-        current_names = {name for name, _ in model.named_parameters()}
-        if current_names != set(self.shadow):
-            raise RuntimeError("Model parameters changed after EMA initialization.")
-        one_minus_decay = 1.0 - self.decay
-        for name, parameter in model.named_parameters():
-            self.shadow[name].mul_(self.decay).add_(parameter.detach(), alpha=one_minus_decay)
-        self.num_updates += 1
-
-    @torch.no_grad()
-    def copy_to(self, model: nn.Module) -> None:
-        if not self.initialized:
-            raise RuntimeError("EMA has not been initialized.")
-        for name, parameter in model.named_parameters():
-            if name not in self.shadow:
-                raise RuntimeError(f"EMA is missing parameter: {name}")
-            parameter.copy_(self.shadow[name])
-
-    @contextmanager
-    def average_parameters(self, model: nn.Module):
-        """Temporarily apply EMA parameters and restore parameters/buffers after use."""
-        backup = {
-            name: value.detach().clone()
-            for name, value in model.state_dict().items()
-        }
-        self.copy_to(model)
-        try:
-            yield
-        finally:
-            model.load_state_dict(backup)
 
 
 def seed_everything(seed: int) -> None:
@@ -220,6 +158,7 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
         manifest_is_stratified = (
             metadata.get("splitter") == "StratifiedGroupKFold"
             and metadata.get("label_col") == str(args.label_col)
+            and metadata.get("cohort") == str(args.cohort)
             and int(metadata.get("seed", -1)) == int(args.seed)
         )
         if existing == requested and manifest_is_stratified:
@@ -247,8 +186,8 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
         str(args.seed),
         "--clinical-path",
         str(args.clinical_path),
-        "--label-col",
-        str(args.label_col),
+        "--experiment-name",
+        str(args.experiment_name),
     ]
     print("\nBuilding middle-fusion manifest:")
     print("$ " + " ".join(command))
@@ -278,16 +217,6 @@ def build_stage2_optimizer(model: GMEModel, args: argparse.Namespace) -> torch.o
         [{"params": backbone_parameters, "weight_decay": args.weight_decay}],
         lr=args.lr_stage2,
     )
-
-
-def reset_stage2_classifier(model: GMEModel, args: argparse.Namespace, device: torch.device) -> None:
-    model.classifier = ABMIL_Cls(
-        D_feat=args.target_dim,
-        D_inner=args.d_inner,
-        D_attn=args.d_attn,
-        n_classes=args.n_classes,
-        droprate=args.droprate,
-    ).to(device)
 
 
 def compute_metrics(labels: Sequence[int], probs: Sequence[float], decision_threshold: float) -> EvalResult:
@@ -329,17 +258,12 @@ def save_checkpoint(path: Path, model: GMEModel, epoch: int, metrics: EvalResult
         "state_dict": model.state_dict(),
         "projection_heads": model.projection_heads.state_dict(),
         "router_stats": model.router.get_routing_stats(),
+        "downstream_head": model.downstream_head,
         "metrics": asdict(metrics),
     }
     if extra:
         payload.update(dict(extra))
     torch.save(payload, path)
-
-
-def load_model_state(path: Path, model: GMEModel, device: torch.device) -> None:
-    payload = torch.load(path, map_location=device)
-    state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
-    model.load_state_dict(state_dict)
 
 
 @torch.no_grad()
@@ -385,71 +309,6 @@ def _min_max_from_score_list(scores: Sequence[torch.Tensor]) -> Tuple[torch.Tens
         raise RuntimeError("Cannot compute routing score stats from an empty score list.")
     values = torch.cat([score.detach().reshape(-1).float().cpu() for score in scores], dim=0)
     return values.min(), values.max(), int(values.numel())
-
-
-def train_stage1_epoch(
-    model: GMEModel,
-    dataset: MultiEncoderSlideDataset,
-    optimizer,
-    device: torch.device,
-    consistency_weight: float,
-    grad_clip: float,
-) -> Tuple[float, float]:
-    """Pretrain ProjectionHead with geometry-only objectives."""
-    model.train()
-    indices = np.random.permutation(len(dataset))
-    total_loss = 0.0
-    total_consistency_loss = 0.0
-
-    for idx in indices:
-        raw_features, _, _ = dataset[int(idx)]
-        raw_features = move_features(raw_features, device)
-
-        optimizer.zero_grad(set_to_none=True)
-        projected = model.project(raw_features)
-        if consistency_weight > 0:
-            consistency_loss = model.encoder_consistency_loss(projected)
-        else:
-            consistency_loss = next(iter(projected.values())).new_tensor(0.0)
-        loss = float(consistency_weight) * consistency_loss
-        loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                [param for param in model.parameters() if param.requires_grad],
-                max_norm=grad_clip,
-            )
-        optimizer.step()
-        total_loss += float(loss.detach().cpu())
-        total_consistency_loss += float(consistency_loss.detach().cpu())
-
-    denom = max(len(dataset), 1)
-    return total_loss / denom, total_consistency_loss / denom
-
-
-@torch.no_grad()
-def evaluate_stage1_geometry(
-    model: GMEModel,
-    dataset: MultiEncoderSlideDataset,
-    device: torch.device,
-    consistency_weight: float,
-) -> Tuple[float, float]:
-    model.eval()
-    total_loss = 0.0
-    total_consistency_loss = 0.0
-    for idx in range(len(dataset)):
-        raw_features, _, _ = dataset[idx]
-        raw_features = move_features(raw_features, device)
-        projected = model.project(raw_features)
-        if consistency_weight > 0:
-            consistency_loss = model.encoder_consistency_loss(projected)
-        else:
-            consistency_loss = next(iter(projected.values())).new_tensor(0.0)
-        loss = float(consistency_weight) * consistency_loss
-        total_loss += float(loss.detach().cpu())
-        total_consistency_loss += float(consistency_loss.detach().cpu())
-
-    denom = max(len(dataset), 1)
-    return total_loss / denom, total_consistency_loss / denom
 
 
 @torch.no_grad()
@@ -616,7 +475,6 @@ def train_teacher_student_epoch(
     distill_weight: float,
     max_distill_loss_ratio: float,
     grad_clip: float,
-    weight_averager: ExponentialMovingAverage | None = None,
 ) -> Tuple[float, float, float, float]:
     """Train the student router with classification and optional distillation."""
     projection_is_trainable = any(param.requires_grad for param in model.projection_heads.parameters())
@@ -678,8 +536,6 @@ def train_teacher_student_epoch(
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
-        if weight_averager is not None:
-            weight_averager.update(model)
         total_loss += float(loss.detach().cpu())
         total_cls_loss += float(cls_loss.detach().cpu())
         total_distill_loss += float(distill_loss.detach().cpu())
@@ -703,7 +559,6 @@ def train_stage2_epoch(
     replacement_strategy: str,
     gaussian_std_scale: float,
     grad_clip: float,
-    weight_averager: ExponentialMovingAverage | None = None,
 ) -> Tuple[float, float]:
     projection_is_trainable = any(param.requires_grad for param in model.projection_heads.parameters())
     model.train()
@@ -744,8 +599,6 @@ def train_stage2_epoch(
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
-        if weight_averager is not None:
-            weight_averager.update(model)
         total_loss += float(loss.detach().cpu())
         total_cls_loss += float(cls_loss.detach().cpu())
 
@@ -979,6 +832,9 @@ def run_fold(
     use_teacher_student = args.routing_mode == "teacher_student"
     use_online_attribution = not use_teacher_student
     use_teacher_distillation = use_teacher_student and float(args.teacher_distill_weight) > 0.0
+    teacher_stage_required = use_teacher_student and (
+        bool(args.mean_fusion_warm_start) or use_teacher_distillation
+    )
 
     train_ds = MultiEncoderSlideDataset(
         manifest=manifest,
@@ -1007,24 +863,6 @@ def run_fold(
         max_patches=args.eval_max_patches,
         training=False,
     )
-    stage1_train_ds = MultiEncoderSlideDataset(
-        manifest=manifest,
-        fold=fold,
-        split="train",
-        clinical_df=clinical_df,
-        label_col=args.label_col,
-        max_patches=args.stage1_max_patches,
-        training=True,
-    )
-    stage1_val_ds = MultiEncoderSlideDataset(
-        manifest=manifest,
-        fold=fold,
-        split="train",
-        clinical_df=clinical_df,
-        label_col=args.label_col,
-        max_patches=args.stage1_eval_max_patches,
-        training=False,
-    )
     input_dims = infer_input_dims(manifest, fold=fold)
     input_dims = {name: input_dims[name] for name in sorted(train_ds.encoder_names)}
 
@@ -1037,6 +875,10 @@ def run_fold(
         d_attn=args.d_attn,
         n_classes=args.n_classes,
         droprate=args.droprate,
+        downstream_head=args.downstream_head,
+        mlp_hidden_dim=args.mlp_hidden_dim,
+        gnn_hidden_dim=args.gnn_hidden_dim,
+        gnn_layers=args.gnn_layers,
         routing_temperature=args.routing_temperature,
         routing_logit_scale=args.routing_logit_scale,
         attribution_target=args.attribution_target,
@@ -1046,6 +888,7 @@ def run_fold(
             else 0
         ),
         student_router_temperature=args.student_router_temperature,
+        student_router_use_consensus=args.student_router_use_consensus,
     ).to(device)
 
     print(f"\nFold {fold}: train={len(train_ds)}, val={len(val_ds)}, encoders={train_ds.encoder_names}")
@@ -1076,103 +919,12 @@ def run_fold(
     inner_val_ds = Subset(train_eval_ds, inner_val_indices)
     inner_baseline_ds = Subset(baseline_ds, inner_train_indices)
     inner_score_stats_ds = Subset(score_stats_ds, inner_train_indices)
-    inner_stage1_train_ds = Subset(stage1_train_ds, inner_train_indices)
-    inner_stage1_val_ds = Subset(stage1_val_ds, inner_val_indices)
     print(
         f"Fold {fold}: outer_train={len(train_ds)}, outer_test={len(val_ds)}, "
         f"inner_train={len(inner_train_ds)}, inner_val={len(inner_val_ds)}"
     )
-    if args.stage1_epochs <= 0 and args.freeze_projection_stage2:
-        raise ValueError("--freeze-projection-stage2 requires --stage1-epochs > 0 so the ProjectionHead is not frozen randomly.")
-    if args.stage1_epochs > 0 and args.stage1_consistency_weight <= 0:
-        raise ValueError("Stage1 would have no loss. Set stage1_consistency_weight > 0.")
-
-    stage1_path = fold_dir / "best_stage1_projection.pt"
-    if args.stage1_epochs > 0:
-        set_projection_trainable(model, True)
-        optimizer1 = torch.optim.AdamW(
-            model.projection_heads.parameters(),
-            lr=args.lr_stage1,
-            weight_decay=args.weight_decay,
-        )
-        scheduler1 = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer1,
-            T_max=max(args.stage1_epochs, 1),
-            eta_min=args.lr_stage1 * 0.01,
-        )
-        best_stage1_loss = math.inf
-        stage1_no_improve = 0
-
-        print(
-            f"Fold {fold} | Stage1 geometry-only ProjectionHead pretrain | "
-            f"epochs={args.stage1_epochs} | "
-            f"freeze_stage2={args.freeze_projection_stage2}"
-        )
-        for epoch in range(1, args.stage1_epochs + 1):
-            train_loss, train_consistency_loss = train_stage1_epoch(
-                model=model,
-                dataset=inner_stage1_train_ds,
-                optimizer=optimizer1,
-                device=device,
-                consistency_weight=args.stage1_consistency_weight,
-                grad_clip=args.grad_clip,
-            )
-            val_loss, val_consistency_loss = evaluate_stage1_geometry(
-                model=model,
-                dataset=inner_stage1_val_ds,
-                device=device,
-                consistency_weight=args.stage1_consistency_weight,
-            )
-            scheduler1.step()
-
-            print(
-                f"Fold {fold} | Stage1 | Epoch {epoch:03d}/{args.stage1_epochs} | "
-                f"train_loss={train_loss:.4f} | consistency={train_consistency_loss:.4f} | "
-                f"val_loss={val_loss:.4f} | val_consistency={val_consistency_loss:.4f}"
-            )
-
-            improved = np.isfinite(val_loss) and val_loss < best_stage1_loss
-            if improved:
-                best_stage1_loss = val_loss
-                stage1_no_improve = 0
-                metrics_payload = {
-                    "val_loss": float(val_loss),
-                    "val_consistency_loss": float(val_consistency_loss),
-                }
-                stage1_payload = {
-                    "epoch": int(epoch),
-                    "state_dict": model.state_dict(),
-                    "projection_heads": model.projection_heads.state_dict(),
-                    "input_dims": input_dims,
-                    "stage": "stage1_projection_pretrain",
-                    "metrics": metrics_payload,
-                    "stage1_consistency_weight": float(args.stage1_consistency_weight),
-                    "policy": "ProjectionHead pretrained with cross-encoder consistency only.",
-                }
-                torch.save(stage1_payload, stage1_path)
-                stage1_metric_row = {
-                    "stage": "stage1",
-                    "epoch": int(epoch),
-                    "val_loss": float(val_loss),
-                    "val_consistency_loss": float(val_consistency_loss),
-                }
-                pd.DataFrame([stage1_metric_row]).to_csv(
-                    fold_dir / "stage1_geometry_metrics.csv",
-                    index=False,
-                    encoding="utf-8-sig",
-                    float_format="%.6f",
-                )
-            else:
-                stage1_no_improve += 1
-                if stage1_no_improve >= args.stage1_patience:
-                    print(f"Fold {fold}: Stage1 early stopping at epoch {epoch}. Best Stage1 val loss={best_stage1_loss:.4f}")
-                    break
-
-        if stage1_path.exists():
-            load_model_state(stage1_path, model, device)
-
     teacher_targets: Dict[str, torch.Tensor] | None = None
-    if use_teacher_student:
+    if teacher_stage_required:
         teacher = copy.deepcopy(model).to(device)
         set_projection_trainable(teacher, True)
         teacher_optimizer = torch.optim.AdamW(
@@ -1191,7 +943,8 @@ def run_fold(
         teacher_history: List[Dict[str, object]] = []
         print(
             f"Fold {fold} | Frozen-attribution teacher pretrain | "
-            f"mean fusion | epochs={args.teacher_epochs}"
+            f"mean fusion | epochs={args.teacher_epochs} | "
+            f"warm_start={bool(args.mean_fusion_warm_start)}"
         )
         for teacher_epoch in range(1, args.teacher_epochs + 1):
             teacher_loss = train_mean_teacher_epoch(
@@ -1205,7 +958,7 @@ def run_fold(
                 teacher,
                 inner_val_ds,
                 device,
-                args.threshold,
+                DEFAULT_DECISION_THRESHOLD,
             )
             teacher_scheduler.step()
             teacher_history.append({
@@ -1288,16 +1041,26 @@ def run_fold(
                 "skipping teacher LOO targets and replacement baselines."
             )
 
-        # Warm-start the student representation and classifier from the frozen
-        # teacher; the embedding router itself remains label-free at inference.
-        model.load_state_dict(teacher.state_dict())
-        set_projection_trainable(model, not bool(args.teacher_freeze_projection))
+        # Optionally initialize the student representation and classifier from
+        # the frozen teacher. The embedding router remains label-free at inference.
+        if args.mean_fusion_warm_start:
+            model.load_state_dict(teacher.state_dict())
+            set_projection_trainable(model, not bool(args.teacher_freeze_projection))
+        else:
+            print(
+                f"Fold {fold}: mean-fusion warm start disabled; "
+                "the main model keeps its independent initialization."
+            )
+            # Without teacher initialization, the student projection must remain
+            # trainable even when teacher_freeze_projection is enabled.
+            set_projection_trainable(model, True)
         del teacher
-    elif args.freeze_projection_stage2:
-        set_projection_trainable(model, False)
-        if args.stage2_warm_start_classifier:
-            print("[Warning] Stage1 is projection-only, so there is no pretrained classifier to warm-start.")
-        reset_stage2_classifier(model, args, device)
+    elif use_teacher_student:
+        print(
+            f"Fold {fold}: teacher stage skipped because mean-fusion warm start is disabled "
+            "and teacher_distill_weight=0."
+        )
+        set_projection_trainable(model, True)
     else:
         set_projection_trainable(model, True)
 
@@ -1312,20 +1075,6 @@ def run_fold(
     best_stage2_metrics: EvalResult | None = None
     no_improve = 0
     stage2_history: List[Dict[str, object]] = []
-    ema = (
-        ExponentialMovingAverage(args.ema_decay)
-        if args.weight_averaging == "ema"
-        else None
-    )
-    if ema is not None:
-        print(
-            f"evaluation weights: {args.weight_averaging}"
-            + (
-                f" | decay={args.ema_decay:g} | start_epoch={args.ema_start_epoch}"
-                if ema is not None
-                else ""
-            )
-        )
     if use_online_attribution:
         baselines, baseline_summary = build_replacement_baselines(
             model,
@@ -1346,8 +1095,6 @@ def run_fold(
         score_stats, interaction_stats = inactive_attribution_stats(model)
 
     for epoch in range(1, args.stage2_epochs + 1):
-        if ema is not None and not ema.initialized and epoch >= args.ema_start_epoch:
-            ema.initialize(model)
         if use_teacher_student:
             if use_teacher_distillation and teacher_targets is None:
                 raise RuntimeError("Teacher targets were not initialized.")
@@ -1366,7 +1113,6 @@ def run_fold(
                 distill_weight=args.teacher_distill_weight,
                 max_distill_loss_ratio=args.teacher_kl_loss_ratio,
                 grad_clip=args.grad_clip,
-                weight_averager=ema if ema is not None and ema.initialized else None,
             )
         else:
             train_loss, train_cls_loss = train_stage2_epoch(
@@ -1378,11 +1124,10 @@ def run_fold(
                 replacement_strategy=args.replacement_strategy,
                 gaussian_std_scale=args.gaussian_std_scale,
                 grad_clip=args.grad_clip,
-                weight_averager=ema if ema is not None and ema.initialized else None,
             )
             train_distill_loss = float("nan")
             effective_distill_weight = float("nan")
-        if use_online_attribution and not args.freeze_projection_stage2:
+        if use_online_attribution:
             baselines, baseline_summary = build_replacement_baselines(
                 model,
                 inner_baseline_ds,
@@ -1398,137 +1143,103 @@ def run_fold(
                 gaussian_std_scale=args.gaussian_std_scale,
             )
         scheduler2.step()
-        use_ema_for_eval = ema is not None and ema.initialized
-        evaluation_context = ema.average_parameters(model) if use_ema_for_eval else nullcontext()
-        with evaluation_context:
-            evaluation_weight_source = "ema" if use_ema_for_eval else "raw"
-            if use_ema_for_eval and use_online_attribution:
-                eval_baselines, eval_baseline_summary = build_replacement_baselines(
-                    model,
-                    inner_baseline_ds,
-                    device,
-                )
-                eval_score_stats, eval_interaction_stats = update_train_offline_stats(
-                    model=model,
-                    dataset=inner_score_stats_ds,
-                    device=device,
-                    baselines=eval_baselines,
-                    replacement_strategy=args.replacement_strategy,
-                    gaussian_std_scale=args.gaussian_std_scale,
-                )
-            else:
-                eval_baselines = baselines
-                eval_baseline_summary = baseline_summary
-                eval_score_stats = score_stats
-                eval_interaction_stats = interaction_stats
+        evaluation_weight_source = "raw"
+        eval_baselines = baselines
+        eval_baseline_summary = baseline_summary
+        eval_score_stats = score_stats
+        eval_interaction_stats = interaction_stats
 
-            val_metrics, val_pred, val_weights, val_interactions = evaluate_stage2(
-                model=model,
-                dataset=inner_val_ds,
-                device=device,
-                baselines=eval_baselines,
-                replacement_strategy=args.replacement_strategy,
-                gaussian_std_scale=args.gaussian_std_scale,
-                decision_threshold=args.threshold,
-                use_student_router=use_teacher_student,
-            )
-            stage2_history.append({
-                "epoch": int(epoch),
-                "evaluation_weight_source": evaluation_weight_source,
-                "ema_updates": int(ema.num_updates) if ema is not None else 0,
-                "train_loss": float(train_loss),
-                "train_cls_loss": float(train_cls_loss),
-                "train_distill_loss": float(train_distill_loss),
-                "effective_distill_weight": float(effective_distill_weight),
-                "inner_auc": float(val_metrics.auc),
-                "inner_auprc": float(val_metrics.auprc),
-                "inner_f1": float(val_metrics.f1),
-            })
-            pd.DataFrame(stage2_history).to_csv(
-                fold_dir / "stage2_training_history.csv",
-                index=False,
-                encoding="utf-8-sig",
-                float_format="%.6f",
-            )
-            print(
-                f"Fold {fold} | Epoch {epoch:03d}/{args.stage2_epochs} | "
-                f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | "
-                f"distill={train_distill_loss:.4f} | "
-                f"inner_AUC={val_metrics.auc:.4f} | inner_AUPRC={val_metrics.auprc:.4f} | "
-                f"F1@{args.threshold:g}={val_metrics.f1:.4f} | "
-            )
+        val_metrics, val_pred, val_weights, val_interactions = evaluate_stage2(
+            model=model,
+            dataset=inner_val_ds,
+            device=device,
+            baselines=eval_baselines,
+            replacement_strategy=args.replacement_strategy,
+            gaussian_std_scale=args.gaussian_std_scale,
+            decision_threshold=DEFAULT_DECISION_THRESHOLD,
+            use_student_router=use_teacher_student,
+        )
+        stage2_history.append({
+            "epoch": int(epoch),
+            "evaluation_weight_source": evaluation_weight_source,
+            "train_loss": float(train_loss),
+            "train_cls_loss": float(train_cls_loss),
+            "train_distill_loss": float(train_distill_loss),
+            "effective_distill_weight": float(effective_distill_weight),
+            "inner_auc": float(val_metrics.auc),
+            "inner_auprc": float(val_metrics.auprc),
+            "inner_f1": float(val_metrics.f1),
+        })
+        pd.DataFrame(stage2_history).to_csv(
+            fold_dir / "stage2_training_history.csv",
+            index=False,
+            encoding="utf-8-sig",
+            float_format="%.6f",
+        )
+        print(
+            f"Fold {fold} | Epoch {epoch:03d}/{args.stage2_epochs} | "
+            f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | "
+            f"distill={train_distill_loss:.4f} | "
+            f"inner_AUC={val_metrics.auc:.4f} | inner_AUPRC={val_metrics.auprc:.4f} | "
+            f"F1@{DEFAULT_DECISION_THRESHOLD:g}={val_metrics.f1:.4f} | "
+        )
 
-            improved = not np.isnan(val_metrics.auc) and val_metrics.auc > best_stage2_auc
-            if improved:
-                best_stage2_auc = val_metrics.auc
-                best_stage2_metrics = val_metrics
-                no_improve = 0
-                save_checkpoint(
-                    best_stage2_path,
-                    model,
-                    epoch,
-                    val_metrics,
-                    {
-                        "input_dims": input_dims,
-                        "stage": "stage2_gme",
-                        "baseline_path": str(fold_dir / "replacement_baselines.pt"),
-                        "freeze_projection_stage2": bool(args.freeze_projection_stage2),
-                        "stage1_path": str(stage1_path) if stage1_path.exists() else None,
-                        "routing_score_stats": eval_score_stats,
-                        "weight_averaging": args.weight_averaging,
-                        "evaluation_weight_source": evaluation_weight_source,
-                        "ema_decay": float(args.ema_decay),
-                        "ema_start_epoch": int(args.ema_start_epoch),
-                        "ema_num_updates": int(ema.num_updates) if ema is not None else 0,
-                        "baseline_policy": (
-                            "Train-only replacement baselines built once from frozen Stage1 projection."
-                            if args.freeze_projection_stage2
-                            else "Train-only replacement baselines rebuilt from current projection after each epoch."
-                        ),
+        improved = not np.isnan(val_metrics.auc) and val_metrics.auc > best_stage2_auc
+        if improved:
+            best_stage2_auc = val_metrics.auc
+            best_stage2_metrics = val_metrics
+            no_improve = 0
+            save_checkpoint(
+                best_stage2_path,
+                model,
+                epoch,
+                val_metrics,
+                {
+                    "input_dims": input_dims,
+                    "stage": "stage2_gme",
+                    "baseline_path": str(fold_dir / "replacement_baselines.pt"),
+                    "routing_score_stats": eval_score_stats,
+                    "evaluation_weight_source": evaluation_weight_source,
+                    "baseline_policy": "Train-only replacement baselines rebuilt from current projection after each epoch.",
+                },
+            )
+            if use_online_attribution:
+                baseline_payload = {
+                    "fold": int(fold),
+                    "baselines": {
+                        name: {
+                            key: value.detach().cpu() if torch.is_tensor(value) else value
+                            for key, value in stats.items()
+                        }
+                        for name, stats in eval_baselines.items()
                     },
+                    "input_dims": input_dims,
+                    "encoder_names": model.encoder_names,
+                    "weight_source": evaluation_weight_source,
+                    "policy": "Train-only replacement baselines rebuilt from the current end-to-end projection space.",
+                    "routing_score_stats": eval_score_stats,
+                }
+                torch.save(baseline_payload, fold_dir / "replacement_baselines.pt")
+                eval_baseline_summary.to_csv(
+                    fold_dir / "replacement_baseline_summary.csv",
+                    index=False,
+                    encoding="utf-8-sig",
                 )
-                if use_online_attribution:
-                    baseline_payload = {
-                        "fold": int(fold),
-                        "baselines": {
-                            name: {
-                                key: value.detach().cpu() if torch.is_tensor(value) else value
-                                for key, value in stats.items()
-                            }
-                            for name, stats in eval_baselines.items()
-                        },
-                        "input_dims": input_dims,
-                        "encoder_names": model.encoder_names,
-                        "weight_source": evaluation_weight_source,
-                        "policy": (
-                            "Train-only replacement baselines built once from frozen Stage1 projection."
-                            if args.freeze_projection_stage2
-                            else "Train-only replacement baselines rebuilt from the current end-to-end projection space."
-                        ),
-                        "routing_score_stats": eval_score_stats,
-                    }
-                    torch.save(baseline_payload, fold_dir / "replacement_baselines.pt")
-                    eval_baseline_summary.to_csv(
-                        fold_dir / "replacement_baseline_summary.csv",
-                        index=False,
-                        encoding="utf-8-sig",
-                    )
-                save_fold_outputs(
-                    fold_dir, "inner_selection", val_metrics, val_pred, val_weights,
-                    interactions=val_interactions,
-                )
-            else:
-                no_improve += 1
-                if no_improve >= args.patience:
-                    print(f"Fold {fold}: early stopping at epoch {epoch}. Best inner Stage2 AUC={best_stage2_auc:.4f}")
-                    break
+            save_fold_outputs(
+                fold_dir, "inner_selection", val_metrics, val_pred, val_weights,
+                interactions=val_interactions,
+            )
+        else:
+            no_improve += 1
+            if no_improve >= args.patience:
+                print(f"Fold {fold}: early stopping at epoch {epoch}. Best inner Stage2 AUC={best_stage2_auc:.4f}")
+                break
 
     if not best_stage2_path.exists():
         raise RuntimeError(f"Fold {fold}: no Stage2 checkpoint was selected on inner validation.")
 
     selected_payload = torch.load(best_stage2_path, map_location=device)
     selected_epoch = int(selected_payload.get("epoch", 1))
-    retrain_ema: ExponentialMovingAverage | None = None
     if args.training_protocol == "nested_refit":
         model.load_state_dict(initial_stage2_state)
         seed_everything(args.seed + fold)
@@ -1537,11 +1248,6 @@ def run_fold(
             retrain_optimizer,
             T_max=max(args.stage2_epochs, 1),
             eta_min=args.lr_stage2 * 0.01,
-        )
-        retrain_ema = (
-            ExponentialMovingAverage(args.ema_decay)
-            if args.weight_averaging == "ema"
-            else None
         )
         if use_online_attribution:
             baselines, baseline_summary = build_replacement_baselines(model, baseline_ds, device)
@@ -1557,12 +1263,6 @@ def run_fold(
             baselines = {}
             final_interaction_stats = inactive_attribution_stats(model)[1]
         for retrain_epoch in range(1, selected_epoch + 1):
-            if (
-                retrain_ema is not None
-                and not retrain_ema.initialized
-                and retrain_epoch >= args.ema_start_epoch
-            ):
-                retrain_ema.initialize(model)
             _, retrain_cls_loss = train_stage2_epoch(
                 model=model,
                 dataset=train_ds,
@@ -1572,14 +1272,9 @@ def run_fold(
                 replacement_strategy=args.replacement_strategy,
                 gaussian_std_scale=args.gaussian_std_scale,
                 grad_clip=args.grad_clip,
-                weight_averager=(
-                    retrain_ema
-                    if retrain_ema is not None and retrain_ema.initialized
-                    else None
-                ),
             )
             retrain_scheduler.step()
-            if use_online_attribution and not args.freeze_projection_stage2:
+            if use_online_attribution:
                 baselines, baseline_summary = build_replacement_baselines(model, baseline_ds, device)
             if use_online_attribution:
                 _, final_interaction_stats = update_train_offline_stats(
@@ -1591,23 +1286,6 @@ def run_fold(
                     gaussian_std_scale=args.gaussian_std_scale,
                 )
         final_weight_source = "raw"
-        if retrain_ema is not None and retrain_ema.initialized:
-            retrain_ema.copy_to(model)
-            final_weight_source = "ema"
-            # Offline statistics must match the averaged model used for test.
-            if use_online_attribution:
-                baselines, baseline_summary = build_replacement_baselines(model, baseline_ds, device)
-                _, final_interaction_stats = update_train_offline_stats(
-                    model=model,
-                    dataset=score_stats_ds,
-                    device=device,
-                    baselines=baselines,
-                    replacement_strategy=args.replacement_strategy,
-                    gaussian_std_scale=args.gaussian_std_scale,
-                )
-        final_ema_num_updates = (
-            int(retrain_ema.num_updates) if retrain_ema is not None else 0
-        )
         final_train_count = len(train_ds)
         checkpoint_stage = "stage2_retrained_outer_train"
         selection_policy = "inner_validation_AUC_then_retrain_on_outer_train"
@@ -1620,8 +1298,7 @@ def run_fold(
         # validation. Test it directly; never expose outer-test to training or
         # checkpoint selection, and do not refit on inner-validation slides.
         model.load_state_dict(selected_payload["state_dict"])
-        final_weight_source = str(selected_payload.get("evaluation_weight_source", "raw"))
-        final_ema_num_updates = int(selected_payload.get("ema_num_updates", 0))
+        final_weight_source = "raw"
         baselines, baseline_summary = build_replacement_baselines(model, inner_baseline_ds, device)
         if use_online_attribution:
             _, final_interaction_stats = update_train_offline_stats(
@@ -1704,13 +1381,13 @@ def run_fold(
         encoding="utf-8-sig",
     )
 
-    decision_threshold = float(args.threshold)
+    decision_threshold = DEFAULT_DECISION_THRESHOLD
     print(f"Fold {fold}: fixed decision threshold={decision_threshold:.6f}")
     with open(fold_dir / "decision_threshold.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "threshold": float(decision_threshold),
-                "source": "fixed_config",
+            "source": "internal_default",
             },
             f,
             indent=2,
@@ -1754,33 +1431,12 @@ def run_fold(
             "training_protocol": args.training_protocol,
             "selection_policy": selection_policy,
             "selected_inner_epoch": selected_epoch,
-            "weight_averaging": args.weight_averaging,
             "evaluation_weight_source": final_weight_source,
-            "ema_decay": float(args.ema_decay),
-            "ema_start_epoch": int(args.ema_start_epoch),
-            "ema_num_updates": int(final_ema_num_updates),
         },
     )
 
     with open(fold_dir / "routing_stats.json", "w", encoding="utf-8") as f:
         json.dump(model.router.get_routing_stats(), f, indent=2)
-    with open(fold_dir / "weight_averaging.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "training_protocol": args.training_protocol,
-                "configured_mode": args.weight_averaging,
-                "final_weight_source": final_weight_source,
-                "ema_decay": float(args.ema_decay),
-                "ema_start_epoch": int(args.ema_start_epoch),
-                "ema_num_updates": int(final_ema_num_updates),
-                "selected_inner_epoch": int(selected_epoch),
-                "offline_statistics_rebuilt_after_ema": (
-                    use_online_attribution and final_weight_source == "ema"
-                ),
-            },
-            f,
-            indent=2,
-        )
     with open(fold_dir / "interaction_analysis.json", "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -1800,7 +1456,6 @@ def run_fold(
         "n_test": len(val_ds),
         "n_val": len(val_ds),
         "weight_source": final_weight_source,
-        "ema_num_updates": int(final_ema_num_updates),
         **asdict(final_metrics),
         **efficiency,
     }
@@ -1820,7 +1475,9 @@ def main() -> None:
     manifest_path = ensure_manifest(args)
     args.manifest = manifest_path
     manifest = pd.read_csv(manifest_path)
-    clinical_df, _, _ = load_uvm_data(args.clinical_path, args.label_col)
+    clinical_df, _, _, cohort = load_experiment_data(args.experiment_name, args.clinical_path)
+    if cohort.label_col != args.label_col:
+        raise RuntimeError("Resolved cohort label does not match the training configuration.")
     clinical_df["slide_id"] = clinical_df["slide_id"].astype(str)
 
     all_folds = sorted(manifest["fold"].dropna().astype(int).unique().tolist())

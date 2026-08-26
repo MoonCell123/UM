@@ -252,6 +252,7 @@ class EmbeddingStudentRouter(nn.Module):
         hidden_dim: int = 64,
         temperature: float = 1.0,
         dropout: float = 0.0,
+        use_consensus: bool = True,
     ):
         super().__init__()
         if not encoder_names:
@@ -262,9 +263,11 @@ class EmbeddingStudentRouter(nn.Module):
             raise ValueError("temperature must be positive.")
         self.encoder_names = list(encoder_names)
         self.temperature = float(temperature)
+        self.use_consensus = bool(use_consensus)
+        router_input_dim = int(feature_dim) * (2 if self.use_consensus else 1)
         self.score_net = nn.Sequential(
-            nn.LayerNorm(2 * int(feature_dim)),
-            nn.Linear(2 * int(feature_dim), int(hidden_dim)),
+            nn.LayerNorm(router_input_dim),
+            nn.Linear(router_input_dim, int(hidden_dim)),
             nn.GELU(),
             nn.Dropout(float(dropout)),
             nn.Linear(int(hidden_dim), 1),
@@ -282,8 +285,12 @@ class EmbeddingStudentRouter(nn.Module):
 
     def forward(self, features_by_encoder: TensorDict) -> RoutingOutput:
         means = self._slide_means(features_by_encoder)
-        consensus = means.mean(dim=0, keepdim=True).expand_as(means)
-        scores = self.score_net(torch.cat([means, consensus], dim=-1)).squeeze(-1)
+        if self.use_consensus:
+            consensus = means.mean(dim=0, keepdim=True).expand_as(means)
+            router_input = torch.cat([means, consensus], dim=-1)
+        else:
+            router_input = means
+        scores = self.score_net(router_input).squeeze(-1)
         scores = scores + self.encoder_bias
         weights = torch.softmax(scores / self.temperature, dim=-1)
         fused, adaptive_fused, names = dual_consistency_fusion(

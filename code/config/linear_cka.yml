@@ -4,16 +4,23 @@ manifest: "output/Middle_Fusion_Manifests/middle_fusion_manifest.csv"
 output_dir: "output/Linear_CKA"
 
 feature_dirs:
+  - "features_conch_v15"
   - "features_gigapath"
+  - "features_hibou_l"
   - "features_hoptimus0"
   - "features_hoptimus1"
+  - "features_midnight12k"
+  - "features_phikon"
+  - "features_phikon_v2"
   - "features_uni_v1"
+  - "features_uni_v2"
   - "features_virchow"
+  - "features_virchow2"
 
 # 0 uses all coordinate-aligned patches. 1024 is a deterministic estimate.
 max_patches: 1024
 seed: 42
-device: "cuda:1"
+device: "cuda:0"
 dtype: "float32"
 strict: false
 

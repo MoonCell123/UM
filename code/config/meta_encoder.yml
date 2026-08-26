@@ -1,0 +1,55 @@
+# Meta-Encoder (patch-level self-attention) on the current five-encoder UVM setup.
+# Run with:
+# i:\\Anaconda\\anaconda3\\envs\\Pytorch\\python.exe code\\train\\train_offline_fusion_baselines.py --config code\\config\\meta_encoder.yml
+
+# Keep the outer CV partition immutable across all seed-42 methods.
+manifest: "output/Middle_Fusion_Manifests_seed42/middle_fusion_manifest.csv"
+build_manifest: false
+feat_base: "L:/20x_256px_0px_overlap"
+feature_dirs:
+  - "features_hoptimus0"
+  - "features_hoptimus1"
+  - "features_virchow2"
+  - "features_uni_v2"
+  - "features_conch_v15"
+manifest_dir: "output/Middle_Fusion_Manifests_seed42"
+cv_folds: 5
+
+clinical_path: "clinical_information.csv"
+output_dir: "output/Meta_Encoder"
+experiment_name: "UVM"
+methods:
+  - "meta_encoder"
+folds: null
+training_protocol: "fixed_split_no_refit"
+seed: 42
+device: "cuda"
+gpu_id: 0
+
+# The original Meta-Encoder block uses a 1024-dimensional, one-head attention.
+meta_encoder_dim: 1024
+meta_encoder_heads: 1
+meta_encoder_dropout: 0.0
+# Chunk queries to reduce peak memory without changing the full attention result.
+meta_encoder_chunk_size: 256
+
+d_inner: 256
+d_attn: 128
+droprate: 0.25
+n_classes: 2
+
+max_epochs: 100
+patience: 8
+inner_val_fraction: 0.2
+lr: 0.0001
+weight_decay: 0.001
+grad_clip: 5.0
+threshold: 0.5
+
+# Full WSI bags contain tens of thousands of patches. Use the same cap for all
+# fusion methods in a controlled comparison; increase only after a memory test.
+max_patches: 0
+eval_max_patches: 0
+profile_samples: 3
+profile_warmup: 3
+profile_repeat: 10
