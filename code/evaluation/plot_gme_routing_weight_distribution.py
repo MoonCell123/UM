@@ -267,7 +267,7 @@ def save_figure(weights: pd.DataFrame, slide_summary: pd.DataFrame, encoder_orde
     draw_heatmap(heatmap_ax, weights, encoder_order)
     draw_violin(violin_ax, weights, encoder_order)
     draw_entropy(entropy_ax, slide_summary)
-    fig.suptitle("GME Out-of-Fold Routing-Weight Distribution", fontsize=15, fontweight="bold")
+    fig.suptitle("Out-of-Fold routing-weight distribution", fontsize=15, fontweight="bold")
     output_path = output_dir / "gme_routing_weight_distribution.png"
     fig.savefig(output_path, dpi=600, bbox_inches="tight")
     fig.savefig(output_path.with_suffix(".pdf"), format="pdf", bbox_inches="tight")

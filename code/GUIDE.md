@@ -388,19 +388,9 @@ PyYAML>=6.0
 5-fold manifest
 ↓
 每一折：
-  Stage 1:
-    raw embedding
+  raw embedding
     ↓
-    ProjectionHead
-    ↓
-    临时 mean fusion + ABMIL
-    ↓
-    用分类 loss 训练 ProjectionHead
-
-  Stage 2:
-    只继承 ProjectionHead
-    重新初始化 Router + ABMIL
-    freeze ProjectionHead
+  ProjectionHead + Router + ABMIL
     ↓
     train split -> projected embedding -> build replacement baselines
     ↓
@@ -426,19 +416,19 @@ PyYAML>=6.0
 - GME 网络、Attribution、Routing 与 joint fusion：`architecture/gme_model.py`
 - 多编码器 H5 数据读取与 patch 对齐：`data_utils/gme_dataset.py`
 - FLOPs、参数量和推理耗时：`train/gme/profiling.py`
-- Build static Beacon、训练阶段与 5-fold 实验编排：`train/gme/experiment.py`
+- GME 训练阶段与 5-fold 实验编排：`train/gme/experiment.py`
 
-python code\train\train_gme.py --config code\config\gme.yml
-python code\train\train_offline_fusion_baselines.py --config code\config\offline_fusion_baselines.yml
-python code\train\run_gme_workflow.py --workflow-mode analysis_only --analysis-source-run-dir output\
+I:\Anaconda\anaconda3\envs\Pytorch\python.exe code\train\train_gme.py --config code\config\gme.yml
+I:\Anaconda\anaconda3\envs\Pytorch\python.exe code\train\train_offline_fusion_baselines.py --config code\config\offline_fusion_baselines.yml
+I:\Anaconda\anaconda3\envs\Pytorch\python.exe .\code\train\run_gme_workflow.py --config .\code\config\gme.yml
 
 ## 多卡协同训练
 跑GME方法：
-python code\train\launch_fold_parallel.py --config code\config\fold_parallel.yml
+I:\Anaconda\anaconda3\envs\Pytorch\python.exe code\train\launch_fold_parallel.py --config code\config\fold_parallel.yml
 同时写好 fold_parallel.yml 和 gme.yml
 
 跑对照实验：
-python code\train\launch_fold_parallel.py --config code\config\fold_parallel_offline.yml
+I:\Anaconda\anaconda3\envs\Pytorch\python.exe code\train\launch_fold_parallel.py --config code\config\fold_parallel_offline.yml
 同时写好 fold_parallel.yml 和 offline_fusion_baselines.yml
 ---
 

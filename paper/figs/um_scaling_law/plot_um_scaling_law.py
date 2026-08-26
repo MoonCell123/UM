@@ -144,9 +144,10 @@ def plot_method(ax: plt.Axes, data: pd.DataFrame, method: str) -> None:
     subset = data.loc[data["method"] == method].sort_values("model_num")
     style = METHOD_STYLES[method]
     is_ours = method == "Ours"
-    ax.plot(
+    ax.errorbar(
         subset["model_num"],
         subset["auc"],
+        yerr=subset["std"],
         label=style["label"],
         color=style["color"],
         linestyle=style["linestyle"],
@@ -156,6 +157,11 @@ def plot_method(ax: plt.Axes, data: pd.DataFrame, method: str) -> None:
         markerfacecolor=style["color"],
         markeredgecolor="white" if is_ours else style["color"],
         markeredgewidth=0.8 if is_ours else 0.4,
+        ecolor=style["color"],
+        elinewidth=0.8,
+        capsize=2.2,
+        capthick=0.8,
+        errorevery=1,
         zorder=5 if is_ours else 3,
     )
 
@@ -181,7 +187,7 @@ def create_figure(data: pd.DataFrame) -> plt.Figure:
         ax.set_title(f"{panel_label} {panel_title}", loc="left", pad=7, fontweight="semibold")
         ax.set_xlim(min(x_values) - 0.25, max(x_values) + 0.25)
         ax.set_xticks(x_values)
-        ax.set_ylim(0.64, 0.91)
+        ax.set_ylim(0.40, 1.00)
         ax.set_yticks([0.65, 0.70, 0.75, 0.80, 0.85, 0.90])
         ax.grid(axis="y", color="#D0D0D0", linewidth=0.65, linestyle="--", alpha=0.55)
         ax.tick_params(axis="both", direction="out", length=3, width=0.7)
