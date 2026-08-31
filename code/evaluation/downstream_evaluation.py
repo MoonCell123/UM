@@ -1,5 +1,5 @@
 """
-Downstream ABMIL evaluation for fused embeddings on UVM D3/M3 classification.
+Downstream evaluation for fused embeddings on UVM D3/M3 classification.
 
 Input is a directory of fused WSI embeddings:
 
@@ -8,8 +8,8 @@ Input is a directory of fused WSI embeddings:
         TCGA-yyy.h5
 
 Each h5 must contain a patch/instance feature matrix under "features", "feats",
-or the first non-"coords" dataset. The script trains ABMIL_Cls with 5-fold CV
-and reports AUC, AUPRC, sensitivity, and specificity.
+or the first non-"coords" dataset. The script trains the selected downstream
+head with 5-fold CV and reports AUC, AUPRC, sensitivity, and specificity.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ for path in (PROJECT_ROOT, CODE_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from architecture.abmil_cls import ABMIL_Cls
+from architecture.gme_heads import build_downstream_head
 from data_utils.cls_dataset import ClsDataset, load_uvm_data
 
 
@@ -56,7 +56,7 @@ FEATURE_KEYS = ("feats", "features")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train ABMIL on fused embeddings for UVM D3/M3 downstream evaluation."
+        description="Train a configurable downstream head on fused embeddings for UVM D3/M3 classification."
     )
     parser.add_argument("--fused-feat-dir", type=Path, required=True, help="Directory containing fused .h5 embeddings.")
     parser.add_argument("--clinical-path", required=True, help="Clinical CSV/XLSX with slide_id and SCNA Cluster No.")
@@ -72,6 +72,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-attn", type=int, default=128)
     parser.add_argument("--droprate", type=float, default=0.25)
     parser.add_argument("--n-classes", type=int, default=2)
+    parser.add_argument(
+        "--downstream-head",
+        type=str.upper,
+        choices=["ABMIL", "TRANSMIL", "GNN", "MLP"],
+        default="ABMIL",
+        help="Downstream head applied to each fused patch bag.",
+    )
+    parser.add_argument("--mlp-hidden-dim", type=int, default=256)
+    parser.add_argument("--gnn-hidden-dim", type=int, default=256)
+    parser.add_argument("--gnn-layers", type=int, default=2)
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
@@ -245,12 +255,16 @@ def train_fold(args: argparse.Namespace, fold: int, train_ids: List[str], val_id
         raise RuntimeError(f"Fold {fold}: empty train or validation dataset.")
 
     seed_everything(args.seed + fold)
-    model = ABMIL_Cls(
-        D_feat=d_feat,
-        D_inner=args.d_inner,
-        D_attn=args.d_attn,
+    model = build_downstream_head(
+        name=args.downstream_head,
+        d_feat=d_feat,
+        d_inner=args.d_inner,
+        d_attn=args.d_attn,
         n_classes=args.n_classes,
         droprate=args.droprate,
+        mlp_hidden_dim=args.mlp_hidden_dim,
+        gnn_hidden_dim=args.gnn_hidden_dim,
+        gnn_layers=args.gnn_layers,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_epochs, eta_min=args.lr * 0.01)
@@ -258,7 +272,7 @@ def train_fold(args: argparse.Namespace, fold: int, train_ids: List[str], val_id
     best_auc = -np.inf
     best_metrics = None
     epochs_no_improve = 0
-    best_path = fold_dir / "best_abmil_model.pth"
+    best_path = fold_dir / f"best_{args.downstream_head.lower()}_model.pth"
 
     for epoch in range(1, args.max_epochs + 1):
         train_loss = train_one_epoch(model, train_ds, optimizer, device, args.accum_steps)
@@ -376,7 +390,7 @@ def main() -> None:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in config.items()}, f, indent=2)
 
     print("=" * 80)
-    print("Downstream ABMIL evaluation on fused embeddings")
+    print(f"Downstream {args.downstream_head} evaluation on fused embeddings")
     print("=" * 80)
     print(f"Fused feature dir: {args.fused_feat_dir}")
     print(f"D_feat: {d_feat}")

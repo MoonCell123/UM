@@ -21,7 +21,7 @@ import torch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests" / "middle_fusion_manifest.csv"
+DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Manifests" / "Manifests_seed35" / "fusion_manifest.csv"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "Linear_CKA"
 FEATURE_KEYS = ("features", "feats")
 

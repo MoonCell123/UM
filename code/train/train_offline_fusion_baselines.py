@@ -9,6 +9,7 @@ Baselines implemented here:
 5. static_global_weight: train-set learned global encoder weights shared by every WSI -> ABMIL.
 6. cross_attention : per-encoder ProjectionHead -> encoder-token cross attention -> ABMIL.
 7. self_attention  : per-encoder ProjectionHead -> encoder-token self attention -> ABMIL.
+8. meta_encoder     : raw per-patch concatenation -> patch-token self attention -> ABMIL.
 
 These are conventional baselines for comparing against train_gme.py. They do
 not use Beacon, intervention attribution, or GME routing.
@@ -34,6 +35,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -53,12 +55,12 @@ for path in (PROJECT_ROOT, CODE_DIR, CODE_DIR / "architecture"):
 
 from architecture.abmil_cls import ABMIL_Cls
 from architecture.projection_head import MultiEncoderProjectionHead, initialize_projection_weights
-from data_utils.cls_dataset import load_uvm_data
+from data_utils.cohort import load_experiment_data, resolve_cohort_spec
 from modules.beacon import infer_input_dims
 
 
-DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests" / "middle_fusion_manifest.csv"
-DEFAULT_MANIFEST_DIR = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests"
+DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Manifests" / "Manifests_seed35" / "fusion_manifest.csv"
+DEFAULT_MANIFEST_DIR = PROJECT_ROOT / "output" / "Manifests"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "Offline_Fusion_Baselines"
 DEFAULT_FEATURE_DIRS = [
     "features_hoptimus1",
@@ -66,8 +68,24 @@ DEFAULT_FEATURE_DIRS = [
     "features_hoptimus0",
 ]
 FEATURE_KEYS = ("feats", "features")
-METHODS = ("mean", "concat", "gated", "static_global_weight", "cross_attention", "self_attention")
+METHODS = (
+    "no_fusion",
+    "mean",
+    "concat",
+    "gated",
+    "static_global_weight",
+    "cross_attention",
+    "self_attention",
+)
+EXTERNAL_METHODS = ("meta_encoder",)
+METHOD_CHOICES = (*METHODS, *EXTERNAL_METHODS)
 PATH_ARGS = ("manifest", "manifest_dir", "output_dir", "run_dir")
+
+
+def project_path(value: str | Path) -> Path:
+    """Resolve repository-relative paths independently of the caller's cwd."""
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 @dataclass
@@ -136,8 +154,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Exact output directory for this run. Overrides --output-dir/--experiment-name timestamp layout.",
     )
-    parser.add_argument("--label-col", default="d3m3")
-    parser.add_argument("--methods", nargs="+", default=["all"], choices=["all", *METHODS])
+    parser.add_argument("--methods", nargs="+", default=["all"], choices=["all", *METHOD_CHOICES])
     parser.add_argument(
         "--single-encoders",
         nargs="*",
@@ -168,6 +185,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cross-attn-heads", type=int, default=4)
     parser.add_argument("--cross-attn-layers", type=int, default=1)
+    parser.add_argument(
+        "--meta-encoder-dim",
+        type=int,
+        default=1024,
+        help="Output dimension of the Meta-Encoder patch self-attention block (paper default: 1024).",
+    )
+    parser.add_argument(
+        "--meta-encoder-heads",
+        type=int,
+        default=1,
+        help="Number of heads in the Meta-Encoder patch self-attention block (paper subtyping code: 1).",
+    )
+    parser.add_argument(
+        "--meta-encoder-dropout",
+        type=float,
+        default=0.0,
+        help="Attention-weight dropout in the Meta-Encoder self-attention block.",
+    )
+    parser.add_argument(
+        "--meta-encoder-chunk-size",
+        type=int,
+        default=0,
+        help=(
+            "Query chunk size for memory-bounded patch self-attention. 0 uses the full NxN attention matrix; "
+            "a positive value preserves the computation while reducing peak memory."
+        ),
+    )
     parser.add_argument("--d-inner", type=int, default=256)
     parser.add_argument("--d-attn", type=int, default=128)
     parser.add_argument("--droprate", type=float, default=0.25)
@@ -200,6 +244,9 @@ def parse_args() -> argparse.Namespace:
         parser.set_defaults(**config)
     args = parser.parse_args()
     args.config = config_args.config
+    cohort = resolve_cohort_spec(args.experiment_name)
+    args.cohort = cohort.name
+    args.label_col = cohort.label_col
     for name in PATH_ARGS:
         value = getattr(args, name, None)
         if value is not None and not isinstance(value, Path):
@@ -275,11 +322,11 @@ def stratified_split_indices(dataset: MultiEncoderSlideDataset, val_fraction: fl
 
 
 def ensure_manifest(args: argparse.Namespace) -> Path:
-    manifest_path = Path(args.manifest)
+    manifest_path = project_path(args.manifest)
     if manifest_path.exists() and not args.build_manifest:
         requested = {str(item) for item in args.feature_dirs}
         existing = set(pd.read_csv(manifest_path, usecols=["feature_dir"])["feature_dir"].astype(str).unique())
-        metadata_path = Path(args.manifest_dir) / "middle_fusion_manifest_config.json"
+        metadata_path = project_path(args.manifest_dir) / "middle_fusion_manifest_config.json"
         metadata = {}
         if metadata_path.exists():
             with open(metadata_path, "r", encoding="utf-8") as handle:
@@ -287,6 +334,7 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
         manifest_is_stratified = (
             metadata.get("splitter") == "StratifiedGroupKFold"
             and metadata.get("label_col") == str(args.label_col)
+            and metadata.get("cohort") == str(args.cohort)
             and int(metadata.get("seed", -1)) == int(args.seed)
         )
         if existing == requested and manifest_is_stratified:
@@ -298,12 +346,14 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
             f"Metadata: {metadata}"
         )
 
-    output_dir = Path(args.manifest_dir)
+    output_dir = project_path(args.manifest_dir)
+    feat_base = project_path(args.feat_base)
+    clinical_path = project_path(args.clinical_path)
     command = [
         sys.executable,
         str(CODE_DIR / "utils" / "build_embedding_manifest.py"),
         "--feat-base",
-        str(args.feat_base),
+        str(feat_base),
         "--output-dir",
         str(output_dir),
         "--feature-dirs",
@@ -313,15 +363,15 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
         "--seed",
         str(args.seed),
         "--clinical-path",
-        str(args.clinical_path),
-        "--label-col",
-        str(args.label_col),
+        str(clinical_path),
+        "--experiment-name",
+        str(args.experiment_name),
     ]
-    print("\nBuilding middle-fusion manifest:")
+    print("\nBuilding manifest:")
     print("$ " + " ".join(command))
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
 
-    built_manifest = output_dir / "middle_fusion_manifest.csv"
+    built_manifest = output_dir / "fusion_manifest.csv"
     if not built_manifest.exists():
         raise FileNotFoundError(f"Manifest builder finished but did not create {built_manifest}")
     return built_manifest
@@ -338,10 +388,32 @@ def get_dataset_key(h5_path: Path) -> str:
         return candidates[0]
 
 
-def read_h5_features(h5_path: Path, dataset_key: str | None = None) -> np.ndarray:
+def get_h5_feature_shape(h5_path: Path, dataset_key: str | None = None) -> Tuple[int, int]:
     key = dataset_key or get_dataset_key(h5_path)
     with h5py.File(h5_path, "r") as f:
-        features = np.asarray(f[key][:], dtype=np.float32)
+        shape = tuple(f[key].shape)
+    if len(shape) == 1:
+        return 1, int(shape[0])
+    if len(shape) != 2:
+        raise ValueError(f"{h5_path}: expected a 2D feature dataset, got {shape}")
+    return int(shape[0]), int(shape[1])
+
+
+def read_h5_features(
+    h5_path: Path,
+    dataset_key: str | None = None,
+    row_indices: np.ndarray | None = None,
+) -> np.ndarray:
+    key = dataset_key or get_dataset_key(h5_path)
+    with h5py.File(h5_path, "r") as f:
+        dataset = f[key]
+        if row_indices is None:
+            features = np.asarray(dataset[:], dtype=np.float32)
+        else:
+            indices = np.asarray(row_indices, dtype=np.int64)
+            if indices.ndim != 1:
+                raise ValueError(f"row_indices must be one-dimensional, got {indices.shape}")
+            features = np.asarray(dataset[indices], dtype=np.float32)
     if features.ndim == 1:
         features = features.reshape(1, -1)
     if features.ndim != 2:
@@ -408,20 +480,23 @@ class MultiEncoderSlideDataset:
     def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], int, str]:
         slide_id = self.slide_ids[int(idx)]
         rows = self.slide_rows[slide_id]
-        features: Dict[str, np.ndarray] = {}
+        feature_specs: Dict[str, Tuple[Path, str | None, int]] = {}
         for _, row in rows.iterrows():
             encoder = str(row["feature_dir"])
             h5_path = Path(row["h5_path"])
             dataset_key = str(row["dataset_key"]) if pd.notna(row.get("dataset_key", None)) else None
-            features[encoder] = read_h5_features(h5_path, dataset_key)
+            n_patches, _ = get_h5_feature_shape(h5_path, dataset_key)
+            feature_specs[encoder] = (h5_path, dataset_key, n_patches)
 
-        min_patches = min(arr.shape[0] for arr in features.values())
+        min_patches = min(spec[2] for spec in feature_specs.values())
         patch_idx = subset_patch_indices(min_patches, self.max_patches, self.training)
         tensor_features = {}
         for encoder in self.encoder_names:
-            arr = features[encoder][:min_patches]
-            if patch_idx is not None:
-                arr = arr[patch_idx]
+            h5_path, dataset_key, n_patches = feature_specs[encoder]
+            row_indices = patch_idx
+            if row_indices is None and n_patches > min_patches:
+                row_indices = np.arange(min_patches, dtype=np.int64)
+            arr = read_h5_features(h5_path, dataset_key, row_indices=row_indices)
             tensor_features[encoder] = torch.from_numpy(arr.astype(np.float32))
 
         label = int(self.clinical.loc[slide_id, self.label_col])
@@ -584,6 +659,125 @@ class SelfAttentionFusion(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return self.reduce(x.flatten(start_dim=1))
+
+
+class MetaEncoderPatchSelfAttention(nn.Module):
+    """The patch-token self-attention block used by Meta-Encoder.
+
+    The published patch-level implementation concatenates all encoder features
+    for each patch and applies self-attention over the WSI patch sequence before
+    the CLAM head. Its custom attention layer accepts a raw input dimension for
+    Q/K/V and projects the sequence to a shared output dimension. This local
+    implementation keeps that behavior while allowing query chunking to avoid
+    materializing the complete attention matrix at once.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 1024,
+        heads: int = 1,
+        dropout: float = 0.0,
+        chunk_size: int = 0,
+    ):
+        super().__init__()
+        if input_dim < 1 or output_dim < 1:
+            raise ValueError("Meta-Encoder dimensions must be positive.")
+        if heads < 1 or output_dim % heads != 0:
+            raise ValueError(
+                f"meta_encoder_dim={output_dim} must be divisible by meta_encoder_heads={heads}."
+            )
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"meta_encoder_dropout must be in [0, 1), got {dropout}.")
+        if chunk_size < 0:
+            raise ValueError(f"meta_encoder_chunk_size must be non-negative, got {chunk_size}.")
+
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.heads = int(heads)
+        self.head_dim = self.output_dim // self.heads
+        self.dropout = float(dropout)
+        self.chunk_size = int(chunk_size)
+        self.q_proj = nn.Linear(self.input_dim, self.output_dim)
+        self.k_proj = nn.Linear(self.input_dim, self.output_dim)
+        self.v_proj = nn.Linear(self.input_dim, self.output_dim)
+        self.out_proj = nn.Linear(self.output_dim, self.output_dim)
+        self.apply(initialize_projection_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2 or x.shape[-1] != self.input_dim:
+            raise ValueError(
+                "Meta-Encoder self-attention expects [N_patches, input_dim], "
+                f"got {tuple(x.shape)} for input_dim={self.input_dim}."
+            )
+        if x.shape[0] == 0:
+            raise ValueError("Meta-Encoder self-attention received an empty patch sequence.")
+
+        # [N, E] -> [heads, N, head_dim].
+        q = self.q_proj(x).view(-1, self.heads, self.head_dim).transpose(0, 1)
+        k = self.k_proj(x).view(-1, self.heads, self.head_dim).transpose(0, 1)
+        v = self.v_proj(x).view(-1, self.heads, self.head_dim).transpose(0, 1)
+        scale = self.head_dim ** -0.5
+        chunk_size = self.chunk_size if self.chunk_size > 0 else q.shape[1]
+        outputs = []
+        for start in range(0, q.shape[1], chunk_size):
+            stop = min(start + chunk_size, q.shape[1])
+            scores = torch.matmul(q[:, start:stop], k.transpose(-2, -1)) * scale
+            weights = torch.softmax(scores, dim=-1)
+            if self.dropout > 0.0:
+                weights = F.dropout(weights, p=self.dropout, training=self.training)
+            outputs.append(torch.matmul(weights, v))
+        attended = torch.cat(outputs, dim=1).transpose(0, 1).contiguous()
+        attended = attended.view(x.shape[0], self.output_dim)
+        return self.out_proj(attended)
+
+
+class MetaEncoderSelfAttentionABMIL(nn.Module):
+    """Meta-Encoder's raw-concat + patch self-attention + ABMIL pipeline."""
+
+    def __init__(self, input_dims: Mapping[str, int], args: argparse.Namespace):
+        super().__init__()
+        if len(input_dims) < 2:
+            raise ValueError("Meta-Encoder requires at least two encoders.")
+        self.encoder_names = sorted(input_dims.keys())
+        self.input_dims = {name: int(input_dims[name]) for name in self.encoder_names}
+        self.input_dim = int(sum(self.input_dims.values()))
+        self.meta_encoder = MetaEncoderPatchSelfAttention(
+            input_dim=self.input_dim,
+            output_dim=int(args.meta_encoder_dim),
+            heads=int(args.meta_encoder_heads),
+            dropout=float(args.meta_encoder_dropout),
+            chunk_size=int(args.meta_encoder_chunk_size),
+        )
+        self.classifier = ABMIL_Cls(
+            D_feat=int(args.meta_encoder_dim),
+            D_inner=args.d_inner,
+            D_attn=args.d_attn,
+            n_classes=args.n_classes,
+            droprate=args.droprate,
+        )
+
+    def forward(self, raw_features: Mapping[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        tensors = []
+        patch_count = None
+        for encoder_name in self.encoder_names:
+            if encoder_name not in raw_features:
+                raise KeyError(f"Missing encoder {encoder_name}; got {list(raw_features)}")
+            tensor = raw_features[encoder_name]
+            if tensor.ndim != 2 or tensor.shape[-1] != self.input_dims[encoder_name]:
+                raise ValueError(
+                    f"{encoder_name}: expected [N, {self.input_dims[encoder_name]}], got {tuple(tensor.shape)}"
+                )
+            if patch_count is None:
+                patch_count = tensor.shape[0]
+            elif tensor.shape[0] != patch_count:
+                raise ValueError(
+                    "Meta-Encoder requires aligned patch counts across encoders; "
+                    f"got {patch_count} and {tensor.shape[0]}."
+                )
+            tensors.append(tensor.float())
+        fused_patches = self.meta_encoder(torch.cat(tensors, dim=-1))
+        return self.classifier(fused_patches)
 
 
 class ProjectedFusionABMIL(nn.Module):
@@ -969,6 +1163,8 @@ def train_fold(
             raise ValueError("no_fusion expects exactly one encoder.")
         encoder_name = next(iter(input_dims.keys()))
         model = SingleEncoderABMIL(encoder_name, int(input_dims[encoder_name]), args).to(device)
+    elif method == "meta_encoder":
+        model = MetaEncoderSelfAttentionABMIL(input_dims, args).to(device)
     else:
         model = ProjectedFusionABMIL(method, input_dims, args).to(device)
 
@@ -1220,10 +1416,18 @@ def main() -> None:
     manifest_path = ensure_manifest(args)
     args.manifest = manifest_path
     manifest = pd.read_csv(manifest_path)
-    clinical_df, _, _ = load_uvm_data(args.clinical_path, args.label_col)
+    clinical_df, _, _, cohort = load_experiment_data(args.experiment_name, args.clinical_path)
+    if cohort.label_col != args.label_col:
+        raise RuntimeError("Resolved cohort label does not match the training configuration.")
     clinical_df["slide_id"] = clinical_df["slide_id"].astype(str)
 
     methods = normalize_methods(args.methods)
+    if "meta_encoder" in methods and (args.max_patches <= 0 or args.eval_max_patches <= 0):
+        print(
+            "[Warning] meta_encoder uses patch-token self-attention with O(N^2) memory. "
+            "Both --max-patches and --eval-max-patches are <= 0, so full WSI bags will be used. "
+            "Set explicit patch caps for a practical run."
+        )
     all_folds = sorted(manifest["fold"].dropna().astype(int).unique().tolist())
     folds = args.folds if args.folds else all_folds
     missing_folds = sorted(set(folds) - set(all_folds))
