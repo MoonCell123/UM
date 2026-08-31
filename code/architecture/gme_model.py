@@ -7,7 +7,7 @@ from typing import Dict, Mapping, Tuple
 import torch
 import torch.nn as nn
 
-from architecture.abmil_cls import ABMIL_Cls
+from architecture.gme_heads import build_downstream_head
 from architecture.projection_head import MultiEncoderProjectionHead
 from modules.attribution import replace_encoder_embedding
 from modules.routing import DualConsistencyRouter, EmbeddingStudentRouter
@@ -27,7 +27,7 @@ def class_logit_margin(logits: torch.Tensor, class_index: int) -> torch.Tensor:
 
 
 class GMEModel(nn.Module):
-    """ProjectionHead + attribution router + ABMIL classifier."""
+    """ProjectionHead + attribution router + configurable downstream head."""
 
     def __init__(
         self,
@@ -38,11 +38,16 @@ class GMEModel(nn.Module):
         d_attn: int = 128,
         n_classes: int = 2,
         droprate: float = 0.25,
+        downstream_head: str = "ABMIL",
+        mlp_hidden_dim: int = 256,
+        gnn_hidden_dim: int = 256,
+        gnn_layers: int = 2,
         routing_temperature: float = 0.5,
         routing_logit_scale: float = 1.0,
         attribution_target: str = "predicted_class",
         student_router_hidden_dim: int = 0,
         student_router_temperature: float = 1.0,
+        student_router_use_consensus: bool = True,
     ):
         super().__init__()
         self.encoder_names = sorted(input_dims.keys())
@@ -62,16 +67,22 @@ class GMEModel(nn.Module):
                 feature_dim=target_dim,
                 hidden_dim=student_router_hidden_dim,
                 temperature=student_router_temperature,
+                use_consensus=student_router_use_consensus,
             )
             if student_router_hidden_dim > 0
             else None
         )
-        self.classifier = ABMIL_Cls(
-            D_feat=target_dim,
-            D_inner=d_inner,
-            D_attn=d_attn,
+        self.downstream_head = str(downstream_head).strip().upper()
+        self.classifier = build_downstream_head(
+            name=self.downstream_head,
+            d_feat=target_dim,
+            d_inner=d_inner,
+            d_attn=d_attn,
             n_classes=n_classes,
             droprate=droprate,
+            mlp_hidden_dim=mlp_hidden_dim,
+            gnn_hidden_dim=gnn_hidden_dim,
+            gnn_layers=gnn_layers,
         )
         self.target_dim = int(target_dim)
         if attribution_target not in {"predicted_class", "class_1"}:
@@ -126,7 +137,9 @@ class GMEModel(nn.Module):
         similarity = torch.sum(normalized * consensus.unsqueeze(0), dim=-1)
         return (1.0 - similarity).mean()
 
-    def forward_mean_fusion(self, projected: Mapping[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_mean_fusion(
+        self, projected: Mapping[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         logits, attn = self.classifier(self.mean_fuse(projected))
         return logits, attn
 

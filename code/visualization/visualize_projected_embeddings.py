@@ -1,11 +1,4 @@
 """Visualize per-encoder projected embeddings together with the static Beacon.
-
-Example:
-    python code/visualization/visualize_projected_embeddings.py \
-        --fold-dir output/GME/gme/20260628_212645_sigmoid/fold_2 \
-        --manifest output/Middle_Fusion_Manifests/middle_fusion_manifest.csv \
-        --clinical-path clinical_information.csv \
-        --split val
 """
 
 from __future__ import annotations
@@ -75,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fold-dir", type=Path, required=True, help="Fold output directory containing best_gme_model.pt and static_beacon_and_baselines.pt.")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Model checkpoint. Default: <fold-dir>/best_gme_model.pt.")
     parser.add_argument("--beacon-file", type=Path, default=None, help="Static Beacon file. Default: <fold-dir>/static_beacon_and_baselines.pt.")
-    parser.add_argument("--manifest", type=Path, default=PROJECT_ROOT / "output" / "Middle_Fusion_Manifests" / "middle_fusion_manifest.csv")
+    parser.add_argument("--manifest", type=Path, default=PROJECT_ROOT / "output" / "Manifests" / "Manifests_seed35" / "fusion_manifest.csv")
     parser.add_argument("--clinical-path", type=Path, default=PROJECT_ROOT / "clinical_information.csv")
     parser.add_argument("--fold", type=int, default=None, help="Fold id. Default: infer from --fold-dir or Beacon file.")
     parser.add_argument("--split", choices=["train", "val", "all"], default="val")

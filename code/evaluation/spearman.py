@@ -58,7 +58,7 @@ except ImportError:  # pragma: no cover - supports package-style execution
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests" / "middle_fusion_manifest.csv"
+DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Manifests" / "Manifests_seed35" / "fusion_manifest.csv"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "Spearman"
 
 

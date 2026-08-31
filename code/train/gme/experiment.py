@@ -64,14 +64,20 @@ from train.gme.profiling import move_features, profile_gme_efficiency
 from train.gme.config import parse_args
 
 
-DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests" / "middle_fusion_manifest.csv"
-DEFAULT_MANIFEST_DIR = PROJECT_ROOT / "output" / "Middle_Fusion_Manifests"
+DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Manifests" / "Manifests_seed35" / "fusion_manifest.csv"
+DEFAULT_MANIFEST_DIR = PROJECT_ROOT / "output" / "Manifests"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "GME"
 DEFAULT_FEATURE_DIRS = [
     "features_hoptimus1",
     "features_virchow",
     "features_hoptimus0",
 ]
+
+
+def project_path(value: str | Path) -> Path:
+    """Resolve repository-relative paths independently of the caller's cwd."""
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
 PATH_ARGS = ("manifest", "manifest_dir", "output_dir", "run_dir")
 DEFAULT_DECISION_THRESHOLD = 0.5
 
@@ -146,11 +152,11 @@ def resolve_device(args: argparse.Namespace) -> torch.device:
 
 def ensure_manifest(args: argparse.Namespace) -> Path:
     """Build the middle-fusion manifest when requested, missing, or stale."""
-    manifest_path = Path(args.manifest)
+    manifest_path = project_path(args.manifest)
     if manifest_path.exists() and not args.build_manifest:
         requested = {str(item) for item in args.feature_dirs}
         existing = set(pd.read_csv(manifest_path, usecols=["feature_dir"])["feature_dir"].astype(str).unique())
-        metadata_path = Path(args.manifest_dir) / "middle_fusion_manifest_config.json"
+        metadata_path = project_path(args.manifest_dir) / "middle_fusion_manifest_config.json"
         metadata = {}
         if metadata_path.exists():
             with open(metadata_path, "r", encoding="utf-8") as handle:
@@ -170,12 +176,14 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
             f"Metadata: {metadata}"
         )
 
-    output_dir = Path(args.manifest_dir)
+    output_dir = project_path(args.manifest_dir)
+    feat_base = project_path(args.feat_base)
+    clinical_path = project_path(args.clinical_path)
     command = [
         sys.executable,
         str(CODE_DIR / "utils" / "build_embedding_manifest.py"),
         "--feat-base",
-        str(args.feat_base),
+        str(feat_base),
         "--output-dir",
         str(output_dir),
         "--feature-dirs",
@@ -185,7 +193,7 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
         "--seed",
         str(args.seed),
         "--clinical-path",
-        str(args.clinical_path),
+        str(clinical_path),
         "--experiment-name",
         str(args.experiment_name),
     ]
@@ -193,7 +201,7 @@ def ensure_manifest(args: argparse.Namespace) -> Path:
     print("$ " + " ".join(command))
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
 
-    built_manifest = output_dir / "middle_fusion_manifest.csv"
+    built_manifest = output_dir / "fusion_manifest.csv"
     if not built_manifest.exists():
         raise FileNotFoundError(f"Manifest builder finished but did not create {built_manifest}")
     return built_manifest
@@ -1179,7 +1187,6 @@ def run_fold(
         print(
             f"Fold {fold} | Epoch {epoch:03d}/{args.stage2_epochs} | "
             f"loss={train_loss:.4f} | cls={train_cls_loss:.4f} | "
-            f"distill={train_distill_loss:.4f} | "
             f"inner_AUC={val_metrics.auc:.4f} | inner_AUPRC={val_metrics.auprc:.4f} | "
             f"F1@{DEFAULT_DECISION_THRESHOLD:g}={val_metrics.f1:.4f} | "
         )
