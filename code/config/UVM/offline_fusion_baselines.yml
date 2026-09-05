@@ -1,28 +1,27 @@
 # Config for code/train/train_offline_fusion_baselines.py
 
-manifest: "output/Middle_Fusion_Manifests/middle_fusion_manifest.csv"
+manifest: "output/Manifests/Manifests_seed2026/fusion_manifest.csv"
 build_manifest: false
 feat_base: "L:/20x_256px_0px_overlap"
 feature_dirs:
-  - "features_hoptimus1"
-  - "features_virchow"
   - "features_hoptimus0"
-  - "features_gigapath"
-  - "features_uni_v1"
-manifest_dir: "output/Middle_Fusion_Manifests"
+  - "features_hoptimus1"
+  - "features_virchow2"
+  - "features_uni_v2"
+  - "features_conch_v15"
+manifest_dir: "output/Manifests/Manifests_seed2026"
 cv_folds: 5
 
 clinical_path: "G:/Fanglun/Project/UM/clinical_information.csv"
-output_dir: "output/Offline_Fusion_Baselines"
-experiment_name: "offline_fusion_baselines"
-label_col: "d3m3"
+output_dir: "G:/Fanglun/Project/UM/output/Offline_Fusion_Baselines" 
+experiment_name: "UVM"
 methods:
-  - "all"
+  - "self_attention"
 single_encoders: null
 folds: null
 # Small dataset: nested_refit. Large dataset: fixed_split_no_refit with folds: [1].
 training_protocol: "fixed_split_no_refit"
-seed: 42
+seed: 2026
 device: "cuda"
 gpu_id: 0
 

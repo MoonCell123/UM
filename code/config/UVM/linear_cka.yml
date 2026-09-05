@@ -1,6 +1,6 @@
 # Config for code/evaluation/compute_linear_cka.py
 
-manifest: "output/Middle_Fusion_Manifests/middle_fusion_manifest.csv"
+manifest: "output/Manifests/Manifests_seed2026/manifest.csv"
 output_dir: "output/Linear_CKA"
 
 feature_dirs:

@@ -1,0 +1,49 @@
+# Config for code/train/train_offline_fusion_baselines.py
+
+manifest: "output/Manifests/Manifests_seed42/fusion_manifest.csv"
+build_manifest: false
+feat_base: "Q:/TCGA-BLCA-features/20x_256px_0px_overlap"
+feature_dirs:
+  - "features_gigapath"
+  - "features_midnight12k"
+  - "features_virchow2"
+  - "features_phikon"
+  - "features_uni_v1"
+manifest_dir: "output/Manifests/Manifests_seed42"
+cv_folds: 5
+
+clinical_path: "G:/Fanglun/Project/UM/dataset/BLCA/task.csv"
+output_dir: "G:/Fanglun/Project/UM/output/Offline_Fusion_Baselines" 
+experiment_name: "BLCA"
+methods:
+  - "all"
+single_encoders: null
+folds: null
+training_protocol: "fixed_split_no_refit"
+seed: 42
+device: "cuda"
+gpu_id: 0
+
+target_dim: 512
+projection_dropout: 0.1
+gated_pooling: "mean"
+cross_attn_heads: 4
+cross_attn_layers: 1
+d_inner: 256
+d_attn: 128
+droprate: 0.25
+n_classes: 2
+
+max_epochs: 100
+patience: 8
+inner_val_fraction: 0.2
+lr: 0.0001
+weight_decay: 0.001
+grad_clip: 5.0
+threshold: 0.5
+
+max_patches: 0
+eval_max_patches: 0
+profile_samples: 10
+profile_warmup: 10
+profile_repeat: 20
