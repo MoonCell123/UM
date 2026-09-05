@@ -150,7 +150,7 @@ def main() -> None:
     all_rows = []
 
     print("=" * 80)
-    print("Middle-fusion h5 manifest creation")
+    print("H5 manifest creation")
     print("=" * 80)
     print(f"Feature base: {args.feat_base}")
     print(f"Feature dirs: {args.feature_dirs}")
@@ -179,7 +179,7 @@ def main() -> None:
         all_rows.extend(fold_rows)
 
     manifest_df = pd.DataFrame(all_rows)
-    manifest_path = args.output_dir / "middle_fusion_manifest.csv"
+    manifest_path = args.output_dir / "fusion_manifest.csv"
     manifest_df.to_csv(manifest_path, index=False, encoding="utf-8-sig")
 
     config = {

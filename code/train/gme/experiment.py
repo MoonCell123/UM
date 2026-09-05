@@ -26,7 +26,6 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
@@ -62,6 +61,7 @@ from modules.attribution import EncoderBaselineAccumulator, replace_encoder_embe
 from modules.routing import DualConsistencyRouter
 from train.gme.profiling import move_features, profile_gme_efficiency
 from train.gme.config import parse_args
+from utils.output_guard import allocate_run_dir, prepare_explicit_run_dir
 
 
 DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Manifests" / "Manifests_seed35" / "fusion_manifest.csv"
@@ -1494,16 +1494,17 @@ def main() -> None:
         raise ValueError(f"Requested folds not found in manifest: {missing_folds}. Available: {all_folds}")
 
     if args.run_dir is not None:
-        output_dir = args.run_dir
+        # An explicit run directory is accepted only when it is new or empty.
+        # This prevents a typo such as ``--run-dir output`` from reusing a
+        # directory that contains previous experiments.
+        output_dir = prepare_explicit_run_dir(args.run_dir)
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = args.output_dir / args.experiment_name / timestamp
-    output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = allocate_run_dir(args.output_dir, args.experiment_name)
     with open(output_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, f, indent=2)
 
     print("=" * 80)
-    print("End-to-end GME middle-fusion training")
+    print("Middle-fusion training")
     print("=" * 80)
     print(f"Manifest: {manifest_path}")
     print(f"Clinical: {args.clinical_path}")

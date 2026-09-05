@@ -12,12 +12,17 @@ import csv
 import json
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CODE_DIR = PROJECT_ROOT / "code"
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+
+from utils.output_guard import allocate_run_dir, resolve_project_path as resolve_guard_path
+
+
 DEFAULT_CONFIG = PROJECT_ROOT / "code" / "config" / "gme.yml"
 DEFAULT_ANALYSIS_ROOT = PROJECT_ROOT / "output" / "Analysis_Result"
 WORKFLOW_MODES = ("fusion_only", "analysis_only", "fusion_and_analysis")
@@ -71,8 +76,7 @@ def resolve_project_path(value: object, default: Path | None = None) -> Path:
         if default is None:
             raise ValueError("A required path is missing from the workflow configuration.")
         return default
-    path = Path(str(value))
-    return path if path.is_absolute() else PROJECT_ROOT / path
+    return resolve_guard_path(str(value))
 
 
 def run_command(command: list[str], label: str) -> None:
@@ -284,10 +288,7 @@ def main() -> None:
     if mode in {"fusion_only", "fusion_and_analysis"}:
         output_dir = resolve_project_path(config.get("output_dir"), PROJECT_ROOT / "output" / "GME")
         experiment_name = str(config.get("experiment_name", "gme"))
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = output_dir / experiment_name / run_id
-        if run_dir.exists():
-            raise FileExistsError(f"Refusing to overwrite existing run directory: {run_dir}")
+        run_dir = allocate_run_dir(output_dir, experiment_name)
         run_fusion(args.config, run_dir)
         source_run_dir = run_dir
 

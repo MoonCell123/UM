@@ -25,7 +25,6 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Mapping, Sequence, Tuple
 from torch.utils.data import Subset
@@ -57,6 +56,7 @@ from architecture.abmil_cls import ABMIL_Cls
 from architecture.projection_head import MultiEncoderProjectionHead, initialize_projection_weights
 from data_utils.cohort import load_experiment_data, resolve_cohort_spec
 from modules.beacon import infer_input_dims
+from utils.output_guard import allocate_run_dir, prepare_explicit_run_dir
 
 
 DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Manifests" / "Manifests_seed35" / "fusion_manifest.csv"
@@ -1435,11 +1435,11 @@ def main() -> None:
         raise ValueError(f"Requested folds not found in manifest: {missing_folds}. Available: {all_folds}")
 
     if args.run_dir is not None:
-        output_dir = args.run_dir
+        # Never reuse a non-empty directory: it can silently mix artifacts
+        # from different methods or make an overwrite look like data loss.
+        output_dir = prepare_explicit_run_dir(args.run_dir)
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = args.output_dir / args.experiment_name / timestamp
-    output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = allocate_run_dir(args.output_dir, args.experiment_name)
     with open(output_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, f, indent=2)
 
