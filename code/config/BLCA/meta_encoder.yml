@@ -1,23 +1,18 @@
-# Meta-Encoder (patch-level self-attention) on the current five-encoder UVM setup.
-# Run with:
-# i:\\Anaconda\\anaconda3\\envs\\Pytorch\\python.exe code\\train\\train_offline_fusion_baselines.py --config code\\config\\meta_encoder.yml
-
-# Keep the outer CV partition immutable across all seed-42 methods.
-manifest: "output/Middle_Fusion_Manifests_seed42/middle_fusion_manifest.csv"
+manifest: "output/Manifests/Manifests_seed42/fusion_manifest.csv"
 build_manifest: false
-feat_base: "L:/20x_256px_0px_overlap"
+feat_base: "Q:/TCGA-BLCA-features/20x_256px_0px_overlap"
 feature_dirs:
-  - "features_hoptimus0"
-  - "features_hoptimus1"
+  - "features_gigapath"
+  - "features_midnight12k"
   - "features_virchow2"
-  - "features_uni_v2"
-  - "features_conch_v15"
-manifest_dir: "output/Middle_Fusion_Manifests_seed42"
+  - "features_phikon"
+  - "features_uni_v1"
+manifest_dir: "output/Manifests/Manifests_seed42"
 cv_folds: 5
 
-clinical_path: "clinical_information.csv"
-output_dir: "output/Meta_Encoder"
-experiment_name: "UVM"
+clinical_path: "G:/Fanglun/Project/UM/dataset/BLCA/task.csv"
+output_dir: "output/Offline_Fusion_Baselines/Meta_Encoder"
+experiment_name: "BLCA"
 methods:
   - "meta_encoder"
 folds: null

@@ -1,28 +1,27 @@
 # Config for code/train/train_gme.py
 
-manifest: "output/Middle_Fusion_Manifests/middle_fusion_manifest.csv"
+manifest: "output/Manifests/Manifests_seed42/fusion_manifest.csv"
 build_manifest: false
-feat_base: "L:/20x_256px_0px_overlap"
+feat_base: "Q:/TCGA-BLCA-features/20x_256px_0px_overlap"
 feature_dirs:
-  - "features_hoptimus1"
-  - "features_virchow"
-  - "features_hoptimus0"
   - "features_gigapath"
+  - "features_midnight12k"
+  - "features_virchow2"
+  - "features_phikon"
   - "features_uni_v1"
-manifest_dir: "output/Middle_Fusion_Manifests"
+manifest_dir: "output/Manifests/Manifests_seed42"
 cv_folds: 5
 
-clinical_path: "G:/Fanglun/Project/UM/clinical_information.csv"
-output_dir: "output/GME"
-experiment_name: "gme"
-label_col: "d3m3"
-workflow_mode: "fusion_and_analysis"  # fusion_only | analysis_only | fusion_and_analysis
+clinical_path: "G:/Fanglun/Project/UM/dataset/BLCA/task.csv"
+output_dir: "G:/Fanglun/Project/UM/output/GME"
+experiment_name: "BLCA"        # UVM or BLCA
+workflow_mode: "fusion_only"  # fusion_only | analysis_only | fusion_and_analysis
 analysis_source_run_dir: null            # analysis_only need fusion result dir
 folds: null     
 training_protocol: "fixed_split_no_refit"  # nested_refit or fixed_split_no_refit; use folds: [1] to train once
-seed: 42
+seed: 42     # seed 42 35 2026
 device: "cuda"
-gpu_id: 0
+gpu_id: 1
 
 target_dim: 512
 projection_dropout: 0.1
@@ -30,41 +29,31 @@ d_inner: 256
 d_attn: 128
 droprate: 0.25
 n_classes: 2
+downstream_head: "ABMIL"   # ABMIL | TransMIL | GNN | MLP
 
-stage1_epochs: 0
-stage1_patience: 5
-lr_stage1: 0.0
-stage1_consistency_weight: 0.5
-stage1_max_patches: 1024
-stage1_eval_max_patches: 1024
-freeze_projection_stage2: false
-stage2_warm_start_classifier: false
-
-stage2_epochs: 80
+stage2_epochs: 100
 patience: 7
 inner_val_fraction: 0.2
 lr_stage2: 0.0001
 weight_decay: 0.001
 grad_clip: 5.0
 
-weight_averaging: "none"    # ema or none
-ema_decay: 0.99
-ema_start_epoch: 2   
-threshold: 0.5
-
 replacement_strategy: "mean"    # embedding mask way
 gaussian_std_scale: 1.0
 attribution_target: "predicted_class"
+
 routing_mode: "teacher_student"  # online_attribution or teacher_student
-teacher_epochs: 20
+teacher_epochs: 100
 teacher_patience: 5
 teacher_lr: 0.0001
-teacher_distill_weight: 0.0       # Keep KL off
+mean_fusion_warm_start: true    # false for ablation
+teacher_distill_weight: 0.0       # 0 skips teacher LOO targets/baselines and KL lookup
 teacher_kl_loss_ratio: 0.0       # Maximum weighted KL / CE loss per sample; 0 disables the cap; 0.1
 teacher_target_temperature: 1.0
 teacher_target_clip: 3.0
 student_router_hidden_dim: 64
 student_router_temperature: 1.0
+student_router_use_consensus: false   # false for ablation
 teacher_freeze_projection: true
 
 max_patches: 0
