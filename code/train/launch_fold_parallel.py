@@ -17,7 +17,6 @@ import os
 import shlex
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -26,6 +25,12 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CODE_DIR = PROJECT_ROOT / "code"
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+
+from utils.output_guard import allocate_run_dir, resolve_project_path
+
+
 DEFAULT_CONFIGS = {
     "gme": CODE_DIR / "config" / "gme.yml",
     "offline": CODE_DIR / "config" / "offline_fusion_baselines.yml",
@@ -191,17 +196,21 @@ def main() -> None:
     args = parse_args()
     train_config_path = args.train_config or DEFAULT_CONFIGS[args.target]
     train_config = load_config(train_config_path)
-    output_dir = args.output_dir or Path(str(train_config.get("output_dir", DEFAULT_OUTPUT_DIRS[args.target])))
+    output_dir = resolve_project_path(
+        args.output_dir or train_config.get("output_dir", DEFAULT_OUTPUT_DIRS[args.target])
+    )
     base_experiment = args.experiment_name or str(train_config.get("experiment_name", f"{args.target}_parallel"))
     python_executable = args.python or sys.executable
     extra_args = normalize_extra_args(args.extra_args)
     fold_groups = split_folds(args.folds, len(args.gpus), args.split_mode)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    launch_dir = args.launch_output_dir / args.target / f"{base_experiment}_{timestamp}"
-    train_run_dir = output_dir / base_experiment / timestamp
-    launch_dir.mkdir(parents=True, exist_ok=True)
-    train_run_dir.mkdir(parents=True, exist_ok=True)
+    launch_root = resolve_project_path(args.launch_output_dir)
+    launch_dir = allocate_run_dir(launch_root / args.target, base_experiment)
+    if args.dry_run:
+        # A dry run should not create a directory in the training output tree.
+        train_run_dir = output_dir / base_experiment / f"dry_run_{launch_dir.name}"
+    else:
+        train_run_dir = allocate_run_dir(output_dir, base_experiment)
 
     processes = []
     expected_subrun_dirs = []
@@ -266,6 +275,13 @@ def main() -> None:
         )
 
     if args.dry_run:
+        # The launch metadata is useful for inspection, but no training output
+        # directory should be left behind by a dry run.
+        if train_run_dir.exists() and not any(train_run_dir.iterdir()):
+            train_run_dir.rmdir()
+        parent = train_run_dir.parent
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
         print(f"\nDry run only. Launch metadata saved to: {launch_dir}")
         return
 
