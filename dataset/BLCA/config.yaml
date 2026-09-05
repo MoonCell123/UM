@@ -1,0 +1,6 @@
+task_type: classification
+organ: bladder
+sample_col: case_id
+label_dict:
+  0: wildtype
+  1: mutant
