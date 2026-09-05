@@ -10,7 +10,7 @@ feature_dirs:
 manifest_dir: "output/Manifests/Manifests_seed2026"
 cv_folds: 5
 
-clinical_path: "clinical_information.csv"
+clinical_path: "G:/Fanglun/Project/UM/dataset/UVM/clinical_information.csv"
 output_dir: "output/Offline_Fusion_Baselines/Meta_Encoder"
 experiment_name: "UVM"
 methods:
