@@ -1,0 +1,26 @@
+# Frozen official ELF baseline on the UVM D3/M3 task.
+# Before evaluation, generate <embedding_root>/<model>_elf/*.h5 using
+# contrast_method/ELF/inference/extract_multiple_model_slide_embedding.py.
+# Official raw-feature mapping: uni -> features_uni_v1, conch_v1_5 ->
+# features_conch_v15, gigapath -> features_gigapath, virchow2 ->
+# features_virchow2, h0 -> features_hoptimus0.
+
+manifest: "output/Manifests/Manifests_seed42/fusion_manifest.csv"
+clinical_path: "dataset/UVM/clinical_information.csv"
+embedding_root: "output/ELF/UVM/slide_embeddings"
+output_dir: "output/ELF/UVM"
+run_name: "official_frozen_linear_probe_seed42"
+
+elf_models:
+  - "uni"
+  - "conch_v1_5"
+  - "gigapath"
+  - "virchow2"
+  - "h0"
+
+folds: null
+seed: 42
+training_protocol: "fixed_split_no_refit"
+inner_val_fraction: 0.2
+threshold: 0.5
+max_iter: 10000

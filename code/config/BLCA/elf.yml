@@ -1,0 +1,19 @@
+manifest: "output/Manifests/BLCA_seed42/fusion_manifest.csv"
+clinical_path: "dataset/BLCA/task.csv"
+embedding_root: "output/ELF/BLCA/slide_embeddings"
+output_dir: "output/ELF/BLCA"
+run_name: "official_frozen_linear_probe_seed42"
+
+elf_models:
+  - "uni"
+  - "conch_v1_5"
+  - "gigapath"
+  - "virchow2"
+  - "h0"
+
+folds: null
+seed: 42
+training_protocol: "fixed_split_no_refit"
+inner_val_fraction: 0.2
+threshold: 0.5
+max_iter: 10000
