@@ -39,22 +39,6 @@ CoR-Fuse & $0.84 \pm 0.01$ & $0.87 \pm 0.01$ & $0.75 \pm 0.02$ & $4.77$ & $52.35
 \end{tabular}
 \end{table}
 
-\begin{figure}[!ht]
-    \centering
-    \includegraphics[width=0.8\linewidth]{figs/um_fm/attribution_distribution.pdf}
-    \caption{Distribution of leave-one-out (LOO) attribution scores \(C_m^{\text{LOO}}\) across 80 TCGA-UVM slides for the encoder set \{UNI, GigaPath, H-optimus-0, H-optimus-1, Virchow\}.
-    This encoder set is selected from the evaluated foundation models for visualization and does not correspond to a specific composition used in the main experiments.
-    Each boxplot shows the distribution of attribution values across slides for encoder $m$. Positive and negative attributions indicate favorable and adverse contributions to the downstream prediction.}
-    \label{fig:attribution_distribution}
-\end{figure}
-
-\begin{figure}[!ht]
-    \centering
-    \includegraphics[width=0.8\linewidth]{figs/um_fm/mean_abs_spearman_heatmap.pdf}
-    \caption{Mean absolute feature-level Spearman correlation $R_{ij}$ across the 13 pathology encoders on TCGA-UVM. The weak and compressed range of Spearman correlations, despite the broader CKA range, highlights that global geometric similarity and feature-level statistical correspondence capture different aspects of encoder relationships.}
-    \label{fig:all_Spearman_heatmap}
-\end{figure}
-
 \begin{table}[!ht]
     \centering
     \caption{Single foundation model performance on TCGA-UVM D3/M3 classification.
@@ -80,6 +64,13 @@ CoR-Fuse & $0.84 \pm 0.01$ & $0.87 \pm 0.01$ & $0.75 \pm 0.02$ & $4.77$ & $52.35
     \bottomrule
     \end{tabular}
 \end{table}
+
+\begin{figure}[!ht]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/um_fm/mean_abs_spearman_heatmap.pdf}
+    \caption{Mean absolute feature-level Spearman correlation $R_{ij}$ across the 13 pathology encoders on TCGA-UVM. The weak and compressed range of Spearman correlations, despite the broader CKA range, highlights that global geometric similarity and feature-level statistical correspondence capture different aspects of encoder relationships.}
+    \label{fig:all_Spearman_heatmap}
+\end{figure}
 
 \clearpage
 \section{Experiments on TCGA-UVM}
@@ -440,21 +431,7 @@ Therefore, the routing stage mainly focuses on refining encoder contributions ra
 Moreover, mean-fusion initialization provides a permutation-symmetric starting point, where all encoders receive equal initial importance before task-specific evidence is introduced.
 This reduces the risk of unstable early routing behavior caused by randomly initialized projections and routing scores, which is particularly relevant in the low-sample regime.
 
-\begin{figure}[!ht]
-    \centering
-    \includegraphics[width=1.0\linewidth]{figs/blca/warm_start/stability_heatmap.pdf}
-    \caption{Heatmaps of three stability metrics (AUC Std, AUC Range, and CV) across five CV folds for models with and without warm start. Smaller values correspond to greater stability. Every metric value in the without-warm-start condition is higher than that in the warm-start setting, verifying the stabilizing effect of warm start.}
-    \label{fig:warmstart_stability_heatmap}
-\end{figure}
 
-\begin{figure}[!ht]
-    \centering
-    \includegraphics[width=0.8\linewidth]{figs/blca/warm_start/fold_wise_comparison.pdf}
-    \caption{Impact of Warm Start on Training Stability and Final Performance. (A) Final test AUC across five folds remains comparable with and without warm start. (B) Warm start reduces training instablibity by 47.9\% on average, yielding more stable optimization trajectories and more predictable training outcomes.}
-    \label{fig:warmstart_fold_wise_comparison}
-\end{figure}
-
-\clearpage
 \section{Rationale for Slide-Level Routing}
 \label{slide-level reasons}
 CoR-Fuse performs routing at the slide level rather than the patch level because the objective of the router is to estimate the relative contribution of different foundation models for a given diagnostic task, rather than to identify discriminative tissue regions. First, the available supervision is provided only at the slide level, where each WSI is associated with a single diagnostic label. Patch-level routing would require learning \(P\times M\) encoder preferences for individual patches without direct patch-level supervision, potentially introducing additional uncertainty.
