@@ -1,11 +1,10 @@
 \begin{abstract}
-The emergence of pathology foundation models (FMs) provides diverse visual representations for computational pathology, yet how to effectively integrate multiple FMs remains unclear. 
-Existing fusion approaches typically aggregate multiple foundation models through fixed or implicitly learned fusion mechanisms, without explicitly considering how encoder contributions vary with representation composition and individual samples.
-To address this gap, we conduct a three-level analysis of multi-foundation-model fusion, spanning representation-level geometry, feature-level rank dependence, and task-level pairwise interaction.
-Through this analysis, we show that fusion effectiveness is influenced by representation composition rather than the number of integrated models alone. 
-We further reveal that representation similarity does not necessarily indicate task-level redundancy, and encoder contributions vary substantially across individual slides. 
-These observations suggest that effective fusion requires adaptive utilization of foundation models based on sample-specific representation characteristics. 
-Motivated by these findings, we propose CoR-Fuse, a consensus-aware two-stage routing fusion framework for adaptive multi-foundation-model integration. 
-Experimental results on TCGA-UVM and TCGA-BLCA demonstrate that CoR-Fuse maintains competitive and stable predictive performance across the evaluated foundation-model compositions, while substantially reducing the parameter count and inference FLOPs relative to attention-based fusion strategies.
-Code is released in the supplementary materials.
+The emergence of pathology foundation models (FMs) provides diverse visual representations for computational pathology, yet when and how to effectively combine multiple FMs remains unclear. 
+Existing fusion approaches typically aggregate multiple foundation models using fixed aggregation or learned fusion mechanisms, without explicitly considering how encoder utility depends on representation composition and downstream task requirements.
+To address this gap, we conduct a three-perspective analysis of multi-foundation-model fusion, examining representation geometry, feature-wise statistical association, and downstream functional contribution.
+Through this analysis, we find that representation similarity alone is insufficient to characterize functional redundancy across the evaluated foundation-model compositions.
+Moreover, no single fusion strategy among those evaluated consistently dominates across compositions, and fusion performance does not improve monotonically as the number of integrated encoders increases, indicating that fusion effectiveness varies with representation composition.
+Motivated by these findings, we propose CoR-Fuse, a lightweight, plug-and-play consensus-aware fusion module for adaptive multi-foundation-model integration. 
+Experimental results on TCGA-UVM and TCGA-BLCA show that CoR-Fuse achieves competitive performance across the evaluated foundation-model compositions, while requiring fewer parameters and FLOPs than attention-based fusion strategies.
+Code is provided in the supplementary material.
 \end{abstract}
