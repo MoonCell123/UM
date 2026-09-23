@@ -1,44 +1,41 @@
 \section{Introduction}
-The rapid development of pathology foundation models(FMs) has advanced computational pathology by learning robust histological representations from large-scale whole-slide image (WSI) datasets, enabling efficient adaptation to diverse clinical diagnostic tasks\citep{conchv1andconchv15,gigapath,hibou,hoptimus0,hoptimus1,midnight12k,phikon,phikonv2,univ1anduniv2,virchow,virchow2}.
-Unlike conventional task-specific models trained on limited disease-specific data, foundation models represent different design paradigms, including vision-only self-supervised learning and vision-language contrastive learning, with heterogeneous pretraining corpora, network architectures, and optimization objectives.
+Pathology foundation models (FMs) provide diverse histological representations learned from large-scale WSI datasets \citep{conchv1andconchv15,gigapath,hibou,hoptimus0,hoptimus1,midnight12k,phikon,phikonv2,univ1anduniv2,virchow,virchow2}.
+However, these models are trained under heterogeneous paradigms, yielding varied representations.
 
-Nevertheless, no single pathology foundation model universally dominates all clinical diagnostic tasks\citep{boutaj2026from,vanderbilt2026goldmark}.
-This limitation introduced a critical challenge: how to effectively integrate multiple foundation model representations.
-In practice, different foundation models capture divergent yet partially overlapping histological patterns, offering independent feature views of WSI data.
-Simply aggregating more models or adopting naive fusion strategies cannot necessarily guarantee consistent performance improvement.
+Nevertheless, no single pathology foundation model universally dominates all clinical diagnostic tasks \citep{boutaj2026from,vanderbilt2026goldmark}.
+This limitation raises a critical challenge: how to effectively integrate heterogeneous foundation model representations.
+Although different foundation models provide diverse feature views of WSI data, simply increasing the number of integrated models or applying naive fusion strategies does not necessarily improve fusion performance.
 
-Existing fusion approaches, including feature concatenation, attention-based method\citep{vaswani2017attention}, mixture-of-experts (MoE) routing\citep{shazeer2017moe}, typically adopt fixed aggregation pipelines for foundation model integration.
-These methods primarily evaluate fixed combinations of foundation models and focus on downstream predictive performance, implicitly assuming that fusion effectiveness is mainly determined by the classification task, the underlying relationships among foundation model representations remain largely unexplored.
-In particular, it remains unclear how representation similarity, feature-level correspondence, and task-specific contribution influence fusion behavior, and under what conditions complex interaction-based fusion methods such as attention can outperform simpler aggregation strategies.
-Therefore, it introduces another challenge: understanding and analyzing the inherent structure and relationship of foundation model representations becomes increasingly important for developing reliable multi-foundation-model integration frameworks.
+Existing fusion approaches, including feature concatenation, attention-based methods \citep{vaswani2017attention}, and mixture-of-experts (MoE) routing \citep{shazeer2017moe}, have explored increasingly adaptive mechanisms for integrating representations.
+However, the relationship between foundation-model representation characteristics and downstream fusion behavior remains insufficiently understood.
 
-In this work, we argue that multi-foundation-model fusion should be formulated as a model-specific contribution estimation problem, rather than a static feature aggregation problem.
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=1.0\linewidth]{figs/um_fm/main figure.pdf}
+    \caption{Overview of CoR-Fuse. Stage 1 initializes projection heads and the downstream classifier with mean fusion, while Stage 2 uses a consensus representation for adaptive routing. For slide $n$ and foundation model $m$, patch representations $\mathbf{X}_m^{(n)}$ are projected to $\mathbf{H}_m^{(n)}$ and mean-pooled into $\mathbf{\mu}_m^{(n)}$. CoR-Fuse produces one set of slide-level routing weights, shared across all patch embeddings to preserve the spatial bag structure, and is compatible with MIL, MLP, and GNN downstream architectures.}
+    \label{fig:main_figure}
+\end{figure}
+
+In this work, we formulate multi-FM fusion as estimating sample-specific encoder contributions to the downstream task, rather than applying fixed weights.
 Each foundation model may contribute useful information, but its relative contribution can vary across models and samples.
-To address all mentioned above challenges, we propose a three-level evaluation framework to evaluate the relationship between foundation model representations.
-First, we adopt centered kernel alignment(CKA)\citep{cka} to quantify geometric similarities across representations from representation-level;
-Second, we employ Spearman's rank correlation\citep{spearman} to measure feature alignment from feature-level;
-Third, we leverage leave-one-out perturbation attribution\citep{loo} and second-order pairwise interaction\citep{interaction} to calculate each representations their own attribution and interaction from task-level.
+To better understand the underlying factors affecting multi-foundation-model fusion, we establish a systematic analysis framework that investigates foundation model relationships from three perspectives.
 
-Through systematic analyses based on this three-level framework, we derive several insightful observations:
-1. Fusion effectiveness depends on foundation-model composition rather than the number of integrated models alone.
-2. High representation similarity does not imply fusion redundancy.
-3. Foundation models exhibit structured representation families.
-4. No single fusion strategy universally dominates, the suitability of strategy is conditioned on the composition of integrated representations.
-5. Per-model marginal contribution is sample-dependent, varying significantly across slides.
+On TCGA-UVM, through systematic analyses based on this three-perspective framework, we derive several insightful observations:
+1. Fusion effectiveness varies with foundation-model composition rather than the number of integrated models alone.
+2. Representation similarity alone does not reliably indicate whether an encoder contributes redundant or complementary task-relevant information.
+3. No single fusion strategy consistently dominates, the relative effectiveness of fusion strategies varies with the composition of the integrated representations.
+4. Per-model marginal contribution is sample-dependent, with substantial variation across slides.
 
-Driven by these key insights, we further devise a consensus-aware routing fusion method(CoR-Fuse), a plug-and-play, task-adaptive two-stage routing optimization module. CoR-Fuse constructs a fused representaion for downstream network no matter multiple instance learning(MIL)\citep{ilse2018abmil},graph neural network (GNN)\citep{gnn} or MLP architectures.
-We extensively evaluate CoR-Fuse across multiple TCGA cohorts\citep{tcga}, examine performance scaling with the increasing number of integrated foundation models, representation similarity, contribution patterns, cross-model interactions, and computational efficiency.
-Experimental results demonstrate that our method achieves the balance between interpretability and efficiency, and competitive performance compared with existing fusion strategies.
+Driven by these key insights, we further develop CoR-Fuse (Consensus-aware Routing Fusion), a lightweight, plug-and-play routing module for multi-foundation-model fusion that combines encoder-specific representations with cross-encoder consensus to estimate task-adaptive encoder weights through a two-stage optimization strategy (Figure~\ref{fig:main_figure}).
+CoR-Fuse constructs a fused representation compatible with downstream architectures, including multiple instance learning (MIL) \citep{ilse2018abmil}, graph neural networks (GNNs) \citep{gnn} and MLP-based classifiers.
+We extensively evaluate CoR-Fuse across multiple TCGA cohorts \citep{tcga}, investigating its robustness under different foundation-model compositions, fusion strategies, and computational settings.
 
 Our main contributions are summarized as follows:
 
 \begin{itemize}
+\item We identify model-specific and sample-specific variation in encoder contributions in multi-foundation-model fusion.
 
-\item We identify the model-specific contribution problem in multi-foundation-model fusion: although each foundation model contributes information to the fused representation, the magnitude of its contribution varies across models and samples, making uniform aggregation suboptimal.
+\item We develop a three-perspective analysis of representation geometry, feature association, and task-level contribution, suggesting that representation similarity alone does not fully characterize functional redundancy or fusion behavior.
 
-\item We propose a three-level representation evaluation framework that analyzes foundation model embeddings in terms of representation geometry, pairwise feature alignment, and task-level contribution and interaction.
-
-\item We introduce CoR-Fuse, which uses mean pooled representation across foundation models as a slide-specific consensus reference, and estimates each model's routing score conditioned on both its own representation and this shared reference.
-
-\item Extensive experiments demonstrate that CoR-Fuse substantially reducing FLOPs and inference latency relative to attention-based fusion methods.
+\item We show that CoR-Fuse provides competitive predictive performance while exhibiting lower empirical composition-level performance dispersion across the evaluated encoder compositions, suggesting more consistent behavior under changes in foundation-model composition.
 \end{itemize}

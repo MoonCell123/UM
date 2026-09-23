@@ -1,7 +1,9 @@
 \section{Conclusion}
-In this work, we reveal that multi-foundation-model fusion not be viewed as a simple model-scaling problem. 
-The usefulness of an encoder depends on the representation composition in which it is used, while similarity between representations alone does not reliably indicate redundancy or task-level utility. 
-Our analyses also show that the relative contribution of foundation models can vary substantially across slides, suggesting that a single universal fusion strategy is insufficient for heterogeneous pathology representations. 
-We propose CoR-Fuse, a consensus-aware routing fusion framework that estimates sample-specific encoder weights from encoder-specific slide descriptors and cross-encoder consensus representations.
-Overall understanding representation composition and adapting encoder contributions are more important for scalable foundation-model integration than simply increasing the number of participating models.
-Future work will evaluate CoR-Fuse on broader multi-center cohorts and domain-shift scenarios, and explore adaptive routing under dynamic foundation-model availability.
+In this work, we demonstrate that multi-foundation-model fusion performance is not simply improved by increasing the number of integrated models. 
+Fusion effectiveness varies with representation composition, while representation similarity alone is insufficient to characterize functional redundancy or task-level utility. 
+These findings motivate the design of CoR-Fuse: consensus conditioning provides cross-encoder context for handling heterogeneous representation compositions, while sample-specific routing accounts for variation in encoder contributions across slides.
+Our study has several limitations.
+First, experiments are conducted on relatively small TCGA cohorts, particularly TCGA-UVM, where performance differences should be interpreted in light of cross-validation variance. 
+Second, although we evaluate CoR-Fuse on two TCGA cohorts, these datasets do not constitute fully independent external validation across institutions or acquisition settings. 
+Future studies will assess the method on larger, multi-institutional cohorts and under domain-shift scenarios.
+Third, our evaluation focuses on diagnostic and molecular classification tasks, and future work will extend CoR-Fuse to prognosis-oriented endpoints such as survival prediction.
