@@ -54,3 +54,20 @@ contrast_method\ELF\checkpoints\elf_slide_encoder.pth
 powershell -ExecutionPolicy Bypass -File .\contrast_method\ELF\feature_extract.ps1
 然后直接评估：
 i:\Anaconda\anaconda3\envs\Pytorch\python.exe .\contrast_method\ELF\evaluation\uvm\evaluate_elf_uvm.py --config .\code\config\UVM\elf.yml
+
+## CKA图
+i:\Anaconda\anaconda3\envs\Pytorch\python.exe `
+.\code\evaluation\plot_pairwise_linear_cka_matrix.py `
+--cka-file .\output\Analysis_Result\foundation_model_clustering\20260806_all13\pairwise_cka_by_slide.csv `
+--output-dir $env:TEMP\cka_heatmap_reproduce `
+--output-name foundation_model_cka_heatmap `
+--order average_linkage `
+--title "Mean Coordinate-Aligned Linear CKA"
+
+## dendrogram图
+i:\Anaconda\anaconda3\envs\Pytorch\python.exe `
+.\code\evaluation\plot_linear_cka_dendrogram.py `
+--cka-file .\output\Analysis_Result\foundation_model_clustering\20260806_all13\pairwise_cka_by_slide.csv `
+--output-dir $env:TEMP\foundation_model_clustering `
+--output-name foundation_model_dendrogram `
+--title "Foundation Model Clustering from 1 - Linear CKA"

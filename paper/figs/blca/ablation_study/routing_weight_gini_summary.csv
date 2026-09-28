@@ -1,0 +1,3 @@
+﻿run,n_oof_slides,n_encoders,slide_gini_mean,slide_gini_std,slide_gini_median,slide_gini_q25,slide_gini_q75,fold_gini_mean,fold_gini_std,normalized_slide_gini_mean,global_mean_weight_gini,mean_max_weight,mean_normalized_entropy,mean_weight_features_gigapath,mean_weight_features_midnight12k,mean_weight_features_phikon,mean_weight_features_uni_v1,mean_weight_features_virchow2
+All (with consensus),455,5,0.226896,0.075211,0.213328,0.174686,0.262222,0.225228,0.051244,0.283620,0.169341,0.344107,0.937195,0.204768,0.137114,0.319360,0.192853,0.145906
+w/o Consensus,455,5,0.229069,0.109536,0.199033,0.155458,0.269371,0.226595,0.093060,0.286336,0.144808,0.345469,0.927859,0.210077,0.149437,0.304821,0.176839,0.158825

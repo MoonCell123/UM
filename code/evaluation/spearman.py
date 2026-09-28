@@ -108,6 +108,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional pairwise_cka_by_wsi.csv for the CKA-Spearman correspondence scatter plot.",
     )
     parser.add_argument(
+        "--summary-file",
+        type=Path,
+        default=None,
+        help=(
+            "Existing encoder-pair Spearman summary CSV. When supplied, only the heatmap is plotted; "
+            "no manifest or H5 features are reloaded."
+        ),
+    )
+    parser.add_argument(
         "--save-feature-matrices",
         action="store_true",
         help="Save each complete [features_A, features_B] Spearman matrix as .npy.",
@@ -151,6 +160,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--high-rho-threshold must be between 0 and 1.")
     if args.cka_file is not None and not args.cka_file.is_file():
         parser.error(f"CKA file not found: {args.cka_file}")
+    if args.summary_file is not None and not args.summary_file.is_file():
+        parser.error(f"Spearman summary file not found: {args.summary_file}")
     return args
 
 
@@ -385,6 +396,31 @@ def write_cka_correspondence(
 
 def main() -> None:
     args = parse_args()
+    if args.summary_file is not None:
+        summary = pd.read_csv(args.summary_file)
+        validate_columns(summary, ("encoder_a", "encoder_b", "mean_absolute_rho"), args.summary_file)
+        summary = summary.copy()
+        summary["encoder_a"] = summary["encoder_a"].astype(str)
+        summary["encoder_b"] = summary["encoder_b"].astype(str)
+        summary["mean_absolute_rho"] = pd.to_numeric(summary["mean_absolute_rho"], errors="coerce")
+        summary = summary.dropna(subset=["encoder_a", "encoder_b", "mean_absolute_rho"])
+        if summary.empty:
+            raise ValueError(f"{args.summary_file}: no valid encoder-pair Spearman rows were found.")
+        feature_dirs = list(args.feature_dirs) if args.feature_dirs else sorted(
+            set(summary["encoder_a"]).union(summary["encoder_b"])
+        )
+        if len(feature_dirs) < 2:
+            raise ValueError("Spearman heatmap requires at least two feature encoders.")
+        missing = sorted(set(feature_dirs) - set(summary["encoder_a"]).union(summary["encoder_b"]))
+        if missing:
+            raise ValueError(f"Requested feature dirs are absent from the summary: {missing}")
+        output_dir = args.output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        plot_mean_abs_heatmap(summary, feature_dirs, output_dir)
+        print(f"Plotted encoder-pair Spearman summary: {args.summary_file}")
+        print(f"Output: {output_dir / 'mean_abs_spearman_heatmap.png'}")
+        return
+
     manifest = pd.read_csv(args.manifest)
     available = sorted(manifest["feature_dir"].dropna().astype(str).unique().tolist())
     feature_dirs = list(args.feature_dirs) if args.feature_dirs else available
