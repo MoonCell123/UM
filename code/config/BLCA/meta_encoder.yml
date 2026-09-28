@@ -1,4 +1,4 @@
-manifest: "output/Manifests/Manifests_seed42/fusion_manifest.csv"
+manifest: "output/Manifests/BLCA_seed42/fusion_manifest.csv"
 build_manifest: false
 feat_base: "Q:/TCGA-BLCA-features/20x_256px_0px_overlap"
 feature_dirs:
@@ -7,7 +7,7 @@ feature_dirs:
   - "features_virchow2"
   - "features_phikon"
   - "features_uni_v1"
-manifest_dir: "output/Manifests/Manifests_seed42"
+manifest_dir: "output/Manifests/BLCA_seed42"
 cv_folds: 5
 
 clinical_path: "G:/Fanglun/Project/UM/dataset/BLCA/task.csv"
@@ -19,7 +19,7 @@ folds: null
 training_protocol: "fixed_split_no_refit"
 seed: 42
 device: "cuda"
-gpu_id: 0
+gpu_id: 1
 
 # The original Meta-Encoder block uses a 1024-dimensional, one-head attention.
 meta_encoder_dim: 1024

@@ -1,0 +1,63 @@
+# FuseCPath patch-level comparison configuration.
+#
+# The paper uses CONCH, Virchow2, and Gigapath patch embeddings.  The current
+# project manifest contains no Gigapath-SE/TITAN/PRISM slide-level embeddings,
+# so this runnable comparison implements the paper's patch branch (multi-view
+# representative selection + C-MSA/CC-MSA-style re-embedding + ABMIL).  The
+# collaborative slide-level distillation branch can be enabled only after
+# slide-level teacher embeddings are added to the data manifest.
+
+manifest: "output/Manifests/FuseCPath/UVM/fusion_manifest.csv"
+build_manifest: true
+feat_base: "L:/20x_256px_0px_overlap"
+feature_dirs:
+  - "features_hoptimus0"
+  - "features_hibou_l"
+  - "features_virchow2"
+  - "features_conch_v15"
+  - "features_uni_v2"
+manifest_dir: "output/Manifests/FuseCPath/UVM"
+cv_folds: 5
+
+clinical_path: "G:/Fanglun/Project/UM/dataset/UVM/clinical_information.csv"
+output_dir: "G:/Fanglun/Project/UM/output/Offline_Fusion_Baselines/FuseCPath"
+experiment_name: "UVM"
+methods:
+  - "fusecpath"
+folds: null
+training_protocol: "fixed_split_no_refit"
+seed: 42
+device: "cuda"
+gpu_id: 1
+
+# FuseCPath patch branch: K clusters and N_K representatives per cluster.
+fusecpath_clusters: 50
+fusecpath_patches_per_cluster: 10
+fusecpath_max_candidates: 1024
+fusecpath_view_dim: 64
+fusecpath_dim: 512
+fusecpath_heads: 8
+fusecpath_local_layers: 2
+fusecpath_cross_cluster_summaries: 3
+fusecpath_dropout: 0.1
+fusecpath_seed: 42
+
+d_inner: 256
+d_attn: 128
+droprate: 0.25
+n_classes: 2
+max_epochs: 100
+patience: 8
+inner_val_fraction: 0.2
+lr: 0.0001
+weight_decay: 0.001
+grad_clip: 5.0
+threshold: 0.5
+
+# These generic patch caps are intentionally disabled: FuseCPath performs its
+# own representative selection before the re-embedding module.
+max_patches: 0
+eval_max_patches: 0
+profile_samples: 3
+profile_warmup: 3
+profile_repeat: 10

@@ -10,6 +10,8 @@ Baselines implemented here:
 6. cross_attention : per-encoder ProjectionHead -> encoder-token cross attention -> ABMIL.
 7. self_attention  : per-encoder ProjectionHead -> encoder-token self attention -> ABMIL.
 8. meta_encoder     : raw per-patch concatenation -> patch-token self attention -> ABMIL.
+9. fusecpath        : multi-view representative selection -> clustered local/cross-cluster
+                       re-embedding -> ABMIL (FuseCPath patch branch).
 
 These are conventional baselines for comparing against train_gme.py. They do
 not use Beacon, intervention attribution, or GME routing.
@@ -53,8 +55,10 @@ for path in (PROJECT_ROOT, CODE_DIR, CODE_DIR / "architecture"):
         sys.path.insert(0, str(path))
 
 from architecture.abmil_cls import ABMIL_Cls
+from architecture.fusecpath import FuseCPathModel
 from architecture.projection_head import MultiEncoderProjectionHead, initialize_projection_weights
 from data_utils.cohort import load_experiment_data, resolve_cohort_spec
+from data_utils.fusecpath_dataset import FuseCPathSlideDataset
 from modules.beacon import infer_input_dims
 from utils.output_guard import allocate_run_dir, prepare_explicit_run_dir
 
@@ -69,15 +73,14 @@ DEFAULT_FEATURE_DIRS = [
 ]
 FEATURE_KEYS = ("feats", "features")
 METHODS = (
-    "no_fusion",
     "mean",
     "concat",
+    "cross_attention",
     "gated",
     "static_global_weight",
-    "cross_attention",
-    "self_attention",
+    "self_attention"
 )
-EXTERNAL_METHODS = ("meta_encoder",)
+EXTERNAL_METHODS = ("meta_encoder", "fusecpath")
 METHOD_CHOICES = (*METHODS, *EXTERNAL_METHODS)
 PATH_ARGS = ("manifest", "manifest_dir", "output_dir", "run_dir")
 
@@ -211,6 +214,46 @@ def parse_args() -> argparse.Namespace:
             "Query chunk size for memory-bounded patch self-attention. 0 uses the full NxN attention matrix; "
             "a positive value preserves the computation while reducing peak memory."
         ),
+    )
+    parser.add_argument(
+        "--fusecpath-dim",
+        type=int,
+        default=512,
+        help="Shared dimension of FuseCPath's patch re-embedding branch.",
+    )
+    parser.add_argument(
+        "--fusecpath-clusters",
+        type=int,
+        default=50,
+        help="Number of multi-view patch clusters used by FuseCPath.",
+    )
+    parser.add_argument(
+        "--fusecpath-patches-per-cluster",
+        type=int,
+        default=10,
+        help="Representative patches selected from each FuseCPath cluster.",
+    )
+    parser.add_argument(
+        "--fusecpath-max-candidates",
+        type=int,
+        default=4096,
+        help="Maximum patches per slide used by the multi-view clustering step.",
+    )
+    parser.add_argument(
+        "--fusecpath-view-dim",
+        type=int,
+        default=64,
+        help="Dimension of each normalized encoder sketch used for clustering.",
+    )
+    parser.add_argument("--fusecpath-heads", type=int, default=8)
+    parser.add_argument("--fusecpath-local-layers", type=int, default=2)
+    parser.add_argument("--fusecpath-cross-cluster-summaries", type=int, default=3)
+    parser.add_argument("--fusecpath-dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--fusecpath-seed",
+        type=int,
+        default=42,
+        help="Seed for deterministic multi-view representative patch selection.",
     )
     parser.add_argument("--d-inner", type=int, default=256)
     parser.add_argument("--d-attn", type=int, default=128)
@@ -1126,7 +1169,19 @@ def train_fold(
     output_dir: Path,
 ) -> Mapping[str, object]:
     encoder_names = list(input_dims.keys())
-    train_ds = MultiEncoderSlideDataset(
+    dataset_cls = FuseCPathSlideDataset if method == "fusecpath" else MultiEncoderSlideDataset
+    dataset_options = (
+        {
+            "fusecpath_clusters": args.fusecpath_clusters,
+            "fusecpath_patches_per_cluster": args.fusecpath_patches_per_cluster,
+            "fusecpath_max_candidates": args.fusecpath_max_candidates,
+            "fusecpath_view_dim": args.fusecpath_view_dim,
+            "fusecpath_seed": args.fusecpath_seed + int(fold),
+        }
+        if method == "fusecpath"
+        else {}
+    )
+    train_ds = dataset_cls(
         manifest=manifest,
         fold=fold,
         split="train",
@@ -1135,8 +1190,9 @@ def train_fold(
         encoder_names=encoder_names,
         max_patches=args.max_patches,
         training=True,
+        **dataset_options,
     )
-    val_ds = MultiEncoderSlideDataset(
+    val_ds = dataset_cls(
         manifest=manifest,
         fold=fold,
         split="val",
@@ -1145,8 +1201,9 @@ def train_fold(
         encoder_names=encoder_names,
         max_patches=args.eval_max_patches,
         training=False,
+        **dataset_options,
     )
-    train_eval_ds = MultiEncoderSlideDataset(
+    train_eval_ds = dataset_cls(
         manifest=manifest,
         fold=fold,
         split="train",
@@ -1155,6 +1212,7 @@ def train_fold(
         encoder_names=encoder_names,
         max_patches=args.max_patches,
         training=False,
+        **dataset_options,
     )
     # Same fold seed across methods makes initialization and data-order RNG comparable.
     seed_everything(args.seed + fold)
@@ -1165,6 +1223,8 @@ def train_fold(
         model = SingleEncoderABMIL(encoder_name, int(input_dims[encoder_name]), args).to(device)
     elif method == "meta_encoder":
         model = MetaEncoderSelfAttentionABMIL(input_dims, args).to(device)
+    elif method == "fusecpath":
+        model = FuseCPathModel(input_dims, args).to(device)
     else:
         model = ProjectedFusionABMIL(method, input_dims, args).to(device)
 
@@ -1397,14 +1457,14 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
             model_dir / "summary_metrics.csv",
             index=False,
             encoding="utf-8-sig",
-            float_format="%.2f",
+            float_format="%.3f",
         )
 
     pd.DataFrame(summary_rows).to_csv(
         output_dir / "summary_metrics.csv",
         index=False,
         encoding="utf-8-sig",
-        float_format="%.2f",
+        float_format="%.3f",
     )
 
 
@@ -1427,6 +1487,12 @@ def main() -> None:
             "[Warning] meta_encoder uses patch-token self-attention with O(N^2) memory. "
             "Both --max-patches and --eval-max-patches are <= 0, so full WSI bags will be used. "
             "Set explicit patch caps for a practical run."
+        )
+    if "fusecpath" in methods:
+        print(
+            "[Info] fusecpath performs its own multi-view representative selection "
+            f"({args.fusecpath_clusters} clusters x {args.fusecpath_patches_per_cluster} patches); "
+            "generic max_patches caps are ignored for this method."
         )
     all_folds = sorted(manifest["fold"].dropna().astype(int).unique().tolist())
     folds = args.folds if args.folds else all_folds

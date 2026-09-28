@@ -1,13 +1,13 @@
-manifest: "output/Manifests/Manifests_seed2026/manifest.csv"
+manifest: "output/Manifests/Manifests_seed35/manifest.csv"
 build_manifest: false
 feat_base: "L:/20x_256px_0px_overlap"
 feature_dirs:
   - "features_hoptimus0"
-  - "features_hoptimus1"
+  - "features_hibou_l"
   - "features_virchow2"
-  - "features_uni_v2"
   - "features_conch_v15"
-manifest_dir: "output/Manifests/Manifests_seed2026"
+  - "features_uni_v2"
+manifest_dir: "output/Manifests/Manifests_seed35"
 cv_folds: 5
 
 clinical_path: "G:/Fanglun/Project/UM/dataset/UVM/clinical_information.csv"
@@ -17,7 +17,7 @@ methods:
   - "meta_encoder"
 folds: null
 training_protocol: "fixed_split_no_refit"
-seed: 2026
+seed: 35
 device: "cuda"
 gpu_id: 0
 
