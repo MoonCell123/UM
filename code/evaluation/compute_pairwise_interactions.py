@@ -8,6 +8,9 @@ second-order intervention quantity
 on held-out WSI bags using the frozen checkpoint.  The interaction values do
 not alter routing, fused representations, predictions, parameter counts, or
 efficiency measurements.
+The exact four-state logits are also saved in ``pairwise_state_logits.csv``.
+State bits refer to (encoder_i, encoder_j): 1 retains the embedding and 0
+replaces it with the configured baseline; every other encoder is unchanged.
 """
 
 from __future__ import annotations
@@ -32,12 +35,37 @@ if str(CODE_DIR) not in sys.path:
 from architecture.gme_model import GMEModel
 from data_utils.cohort import load_experiment_data, resolve_cohort_spec
 from data_utils.gme_dataset import MultiEncoderSlideDataset
-from train.gme.experiment import build_replacement_baselines, move_features
+from train.gme.experiment import move_features
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Manifests" / "Manifests_seed35" / "fusion_manifest.csv"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "Pairwise_Interactions"
+STATE_BITS = ("00", "10", "01", "11")
+
+
+def pair_state_logit_columns(
+    cache: Mapping[frozenset[str], torch.Tensor], left: str, right: str
+) -> Dict[str, float | int]:
+    """Serialize exact cached logits; never rerun the classifier."""
+    masks = (frozenset({left, right}), frozenset({right}),
+             frozenset({left}), frozenset())
+    columns: Dict[str, float | int] = {}
+    n_classes = None
+    for state, mask in zip(STATE_BITS, masks):
+        logits = cache[mask]
+        if logits.ndim != 2 or logits.shape[0] != 1 or logits.shape[1] < 2:
+            raise ValueError(f"Expected single-WSI logits [1, C>=2], got {tuple(logits.shape)}")
+        values = logits.detach().cpu().double().numpy()[0]
+        if not np.isfinite(values).all():
+            raise ValueError(f"Non-finite logits for state {state}")
+        if n_classes is not None and len(values) != n_classes:
+            raise ValueError("Class count differs between coalition states")
+        n_classes = len(values)
+        columns.update({f"logit_{state}_class_{c}": float(value)
+                        for c, value in enumerate(values)})
+    columns["n_classes"] = int(n_classes)
+    return columns
 
 
 def parse_args() -> argparse.Namespace:
@@ -231,12 +259,18 @@ def main() -> None:
                 "gaussian_std_scale": gaussian_std_scale,
                 "target_class": int(args.target_class),
                 "analysis_only": True,
+                "state_logits_file": "pairwise_state_logits.csv",
+                "state_schema_version": 1,
+                "reference_forward": "mean_fusion",
+                "state_definition": "bits=(encoder_i,encoder_j); 1=retained, 0=baseline-replaced; other encoders unchanged",
+                "replacement_draws": "Exact coalition cache, including the original Gaussian draws; no extra forwards",
             },
             handle,
             indent=2,
         )
 
     pair_rows = []
+    state_rows = []
     summary_rows = []
     errors = []
     with torch.no_grad():
@@ -249,6 +283,7 @@ def main() -> None:
             try:
                 raw_features = move_features(raw_features, device)
                 projected = model.project(raw_features)
+                coalition_logits: Dict[frozenset[str], torch.Tensor] = {}
                 _, _, interaction_matrix = model.intervention_attribution(
                     projected=projected,
                     baselines=baselines,
@@ -256,18 +291,21 @@ def main() -> None:
                     gaussian_std_scale=gaussian_std_scale,
                     compute_interactions=True,
                     interaction_target_class=int(args.target_class),
+                    coalition_logits_out=coalition_logits,
                 )
                 matrix = interaction_matrix.detach().cpu().numpy().astype(np.float64)
                 pd.DataFrame(matrix, index=feature_dirs, columns=feature_dirs).to_csv(
                     matrix_dir / f"{slide_id}_interaction_matrix.csv", encoding="utf-8-sig", float_format="%.6f"
                 )
                 values = []
+                slide_pair_rows = []
+                slide_state_rows = []
                 for i, left in enumerate(feature_dirs):
                     for j in range(i + 1, len(feature_dirs)):
                         right = feature_dirs[j]
                         value = float(matrix[i, j])
                         values.append(value)
-                        pair_rows.append(
+                        slide_pair_rows.append(
                             {
                                 "slide_id": slide_id,
                                 "label": int(label),
@@ -278,6 +316,26 @@ def main() -> None:
                                 "target_class": int(args.target_class),
                             }
                         )
+                        slide_state_rows.append({
+                            "schema_version": 1,
+                            "slide_id": slide_id,
+                            "label": int(label),
+                            "fold": int(fold),
+                            "split": args.split,
+                            "encoder_i": left,
+                            "encoder_j": right,
+                            "target_class": int(args.target_class),
+                            "interaction": value,
+                            "checkpoint": str(checkpoint_path.resolve()),
+                            "baseline_file": str(baseline_path.resolve()),
+                            "replacement_strategy": replacement_strategy,
+                            "gaussian_std_scale": gaussian_std_scale,
+                            "reference_forward": "mean_fusion",
+                            **pair_state_logit_columns(coalition_logits, left, right),
+                        })
+                # Commit a WSI only after all pairs have been serialized.
+                pair_rows.extend(slide_pair_rows)
+                state_rows.extend(slide_state_rows)
                 summary_rows.append(
                     {
                         "slide_id": slide_id,
@@ -298,6 +356,10 @@ def main() -> None:
         raise RuntimeError("Interaction analysis failed for every selected WSI.")
     pairs_df = pd.DataFrame(pair_rows)
     pairs_df.to_csv(output_dir / "pairwise_interactions.csv", index=False, encoding="utf-8-sig", float_format="%.6f")
+    pd.DataFrame(state_rows).to_csv(
+        output_dir / "pairwise_state_logits.csv", index=False,
+        encoding="utf-8-sig", float_format="%.17g",
+    )
     pd.DataFrame(summary_rows).to_csv(
         output_dir / "wsi_interaction_summary.csv", index=False, encoding="utf-8-sig", float_format="%.6f"
     )

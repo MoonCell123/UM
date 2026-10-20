@@ -152,15 +152,18 @@ class GMEModel(nn.Module):
         compute_interactions: bool = False,
         interaction_target_class: int | None = None,
         target_class: int | None = None,
+        coalition_logits_out: Dict[frozenset[str], torch.Tensor] | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return attribution routing scores and optional signed interactions.
 
         Every masked coalition is evaluated once and cached. Coalition scores
         either explain the class predicted by the complete encoder set or use
         a fixed class-1 margin, according to ``self.attribution_target``.
-        Pairwise interactions never modify the routing score or encoder
-        weights; the fixed class-1 version may modulate the separate joint
-        representation branch.
+        Pairwise interactions never modify routing or fused representations.
+        If supplied, ``coalition_logits_out`` receives detached CPU copies of
+        the exact cached logits, keyed by the set of replaced encoders. This
+        does not add forward passes or redraw stochastic replacements. The
+        existing three-tensor return value remains unchanged.
         """
         classifier_was_training = self.classifier.training
         router_was_training = self.router.training
@@ -236,6 +239,12 @@ class GMEModel(nn.Module):
                             )
                             interactions[i, j] = value
                             interactions[j, i] = value
+                if coalition_logits_out is not None:
+                    coalition_logits_out.clear()
+                    coalition_logits_out.update({
+                        masked: logits.detach().cpu().clone()
+                        for masked, logits in coalition_cache.items()
+                    })
         finally:
             self.classifier.train(classifier_was_training)
             self.router.train(router_was_training)

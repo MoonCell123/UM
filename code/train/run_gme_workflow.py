@@ -1,8 +1,8 @@
 """Run the GME fusion branch and/or its post-hoc analysis branch.
 
 The training entry point remains ``train_gme.py``.  This launcher owns the
-workflow-level sequencing so CKA, Spearman, pairwise interactions, and
-post-hoc routing analyses never become part of model training or inference.
+workflow-level sequencing so CKA, Spearman, pairwise interactions, four-state
+diagnostics, and routing analyses remain outside model training and inference.
 """
 
 from __future__ import annotations
@@ -202,8 +202,13 @@ def run_analysis(source_run_dir: Path, analysis_dir: Path, device_override: str 
     )
     if not fold_dirs:
         raise RuntimeError(f"No fold directories found under {source_run_dir}")
+    # Isolate this invocation from earlier analysis_only runs. Both downstream
+    # analyses must consume only the interaction exports generated below.
+    interaction_run_dir = allocate_run_dir(analysis_dir, "interactions")
+    state_files: list[Path] = []
     for fold_dir in fold_dirs:
         fold = int(fold_dir.name.rsplit("_", 1)[-1])
+        interaction_fold_dir = interaction_run_dir / f"fold_{fold}"
         interaction_command = [
             sys.executable,
             str(PROJECT_ROOT / "code" / "evaluation" / "compute_pairwise_interactions.py"),
@@ -220,7 +225,7 @@ def run_analysis(source_run_dir: Path, analysis_dir: Path, device_override: str 
             "--split",
             "val",
             "--output-dir",
-            str(analysis_dir / "interactions" / f"fold_{fold}"),
+            str(interaction_fold_dir),
             "--device",
             device,
             "--replacement-strategy",
@@ -229,6 +234,28 @@ def run_analysis(source_run_dir: Path, analysis_dir: Path, device_override: str 
             gaussian_std_scale,
         ]
         run_command(interaction_command, f"analysis: interaction fold {fold}")
+        fold_state_files = sorted(interaction_fold_dir.rglob("pairwise_state_logits.csv"))
+        if len(fold_state_files) != 1:
+            raise RuntimeError(
+                f"Interaction fold {fold} must produce exactly one pairwise_state_logits.csv "
+                f"in its fresh output directory; found {len(fold_state_files)} in {interaction_fold_dir}."
+            )
+        state_files.append(fold_state_files[0])
+
+    state_analysis_dir = allocate_run_dir(analysis_dir, "pairwise_state_analysis")
+    state_analysis_command = [
+        sys.executable,
+        str(PROJECT_ROOT / "code" / "evaluation" / "analyze_pairwise_states.py"),
+        "--input-files",
+        *(str(path) for path in state_files),
+        "--output-dir",
+        str(state_analysis_dir),
+        "--split",
+        "val",
+        "--margin-target",
+        "true",
+    ]
+    run_command(state_analysis_command, "analysis: four-state pairwise diagnostics")
 
     quadrant_command = [
         sys.executable,
@@ -236,7 +263,7 @@ def run_analysis(source_run_dir: Path, analysis_dir: Path, device_override: str 
         "--cka-root",
         str(analysis_dir / "cka"),
         "--interaction-root",
-        str(analysis_dir / "interactions"),
+        str(interaction_run_dir),
         "--output-dir",
         str(analysis_dir / "cka_interaction_quadrants"),
     ]
@@ -260,10 +287,18 @@ def run_analysis(source_run_dir: Path, analysis_dir: Path, device_override: str 
                 "clinical_path": str(clinical_path),
                 "feature_dirs": feature_dirs,
                 "device": device,
+                "interaction_run_dir": str(interaction_run_dir),
+                "pairwise_state_analysis": {
+                    "input_files": [str(path) for path in state_files],
+                    "output_dir": str(state_analysis_dir),
+                    "split": "val",
+                    "margin_target": "true",
+                },
                 "analysis": [
                     "linear_cka",
                     "spearman",
                     "pairwise_interactions",
+                    "pairwise_state_analysis",
                     "cka_interaction_quadrants",
                     "oof_routing_weight_distribution",
                 ],
