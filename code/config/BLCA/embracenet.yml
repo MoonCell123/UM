@@ -1,0 +1,95 @@
+# EmbraceNet baseline for TCGA-BLCA.
+# Entry point: code/train/train_offline_fusion_baselines.py
+#
+# The current implementation performs:
+#   raw aligned patch bags from all FMs
+#       -> one trainable ProjectionHead per FM (target_dim)
+#       -> EmbraceNet stochastic per-patch/per-channel encoder selection
+#       -> ABMIL over the fused patch bag
+#       -> WSI-level classification
+#
+# This file intentionally runs only EmbraceNet. Use the offline_fusion_baselines
+# config when comparing several baseline methods in one run.
+
+manifest: "output/Manifests/Manifests_seed42/fusion_manifest.csv"
+build_manifest: false
+feat_base: "Q:/TCGA-BLCA-features/20x_256px_0px_overlap"
+feature_dirs:
+  - "features_gigapath"
+  - "features_midnight12k"
+  - "features_virchow2"
+  - "features_phikon"
+  - "features_uni_v1"
+manifest_dir: "output/Manifests/Manifests_seed42"
+cv_folds: 5
+
+clinical_path: "G:/Fanglun/Project/UM/dataset/BLCA/task.csv"
+output_dir: "G:/Fanglun/Project/UM/output/Offline_Fusion_Baselines"
+experiment_name: "BLCA"
+methods:
+  - "embracenet"
+single_encoders: null
+folds: null
+
+# fixed_split_no_refit selects the best checkpoint on the inner validation
+# split and evaluates that checkpoint on the outer held-out split. Use
+# nested_refit for the more expensive inner-selection + outer-train refit.
+training_protocol: "fixed_split_no_refit"
+seed: 2026
+device: "cuda"
+gpu_id: 0
+
+# Input projection and EmbraceNet.
+# All selected FM patch features are projected independently to target_dim.
+target_dim: 512
+projection_dropout: 0.1
+# EmbraceNet samples one encoder independently for every projected channel of
+# every patch, with uniform selection probabilities in the current implementation.
+# During evaluation, average predictions over repeated stochastic draws.
+embracenet_eval_repeats: 20  # same numeric value as profile_repeat below
+embracenet_eval_seed: 2026    # same as the experiment seed above
+
+# Unused by embracenet, retained here so this config documents the complete
+# shared fusion-baseline interface and can be extended without missing fields.
+gated_pooling: "mean"
+cross_attn_heads: 4
+cross_attn_layers: 1
+meta_encoder_dim: 1024
+meta_encoder_heads: 1
+meta_encoder_dropout: 0.0
+meta_encoder_chunk_size: 0
+fusecpath_dim: 512
+fusecpath_clusters: 50
+fusecpath_patches_per_cluster: 10
+fusecpath_max_candidates: 4096
+fusecpath_view_dim: 64
+fusecpath_heads: 8
+fusecpath_local_layers: 2
+fusecpath_cross_cluster_summaries: 3
+fusecpath_dropout: 0.1
+fusecpath_seed: 42
+
+# ABMIL downstream head.
+d_inner: 256
+d_attn: 128
+droprate: 0.25
+n_classes: 2
+
+# Optimization and early stopping.
+max_epochs: 100
+patience: 8
+inner_val_fraction: 0.2
+lr: 0.0001
+weight_decay: 0.001
+grad_clip: 5.0
+threshold: 0.5
+
+# Patch sampling. 0 means use all aligned patches. Training uses the dataset's
+# stochastic cap when max_patches > 0; evaluation uses eval_max_patches.
+max_patches: 0
+eval_max_patches: 0
+
+# Efficiency profiling. profile_samples=0 disables profiling.
+profile_samples: 10
+profile_warmup: 10
+profile_repeat: 20

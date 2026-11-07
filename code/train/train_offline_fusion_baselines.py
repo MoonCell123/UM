@@ -12,6 +12,8 @@ Baselines implemented here:
 8. meta_encoder     : raw per-patch concatenation -> patch-token self attention -> ABMIL.
 9. fusecpath        : multi-view representative selection -> clustered local/cross-cluster
                        re-embedding -> ABMIL (FuseCPath patch branch).
+10. embracenet     : shared projection interface -> stochastic per-patch/channel
+                       modality selection (official bypass-docking semantics) -> ABMIL.
 
 These are conventional baselines for comparing against train_gme.py. They do
 not use Beacon, intervention attribution, or GME routing.
@@ -78,7 +80,8 @@ METHODS = (
     "cross_attention",
     "gated",
     "static_global_weight",
-    "self_attention"
+    "self_attention",
+    "embracenet",
 )
 EXTERNAL_METHODS = ("meta_encoder", "fusecpath")
 METHOD_CHOICES = (*METHODS, *EXTERNAL_METHODS)
@@ -180,6 +183,21 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--target-dim", type=int, default=512)
     parser.add_argument("--projection-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--embracenet-eval-repeats", type=int, default=20,
+        help=(
+            "Project-level stochastic prediction ensemble count for EmbraceNet evaluation; "
+            "20 matches the shared profile_repeat setting. The official EmbraceNet core "
+            "implementation does not define this evaluation parameter."
+        ),
+    )
+    parser.add_argument(
+        "--embracenet-eval-seed", type=int, default=42,
+        help=(
+            "Project-level fixed sampling seed for reproducible EmbraceNet validation/test "
+            "without advancing training RNG; dataset configs override it to their main seed."
+        ),
+    )
     parser.add_argument(
         "--gated-pooling",
         choices=["mean", "attention"],
@@ -298,6 +316,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--clinical-path is required, either in CLI or config.")
     if not 0.0 < args.inner_val_fraction < 1.0:
         raise ValueError("--inner-val-fraction must be between 0 and 1.")
+    if args.embracenet_eval_repeats < 1:
+        raise ValueError("--embracenet-eval-repeats must be at least 1.")
+    if args.embracenet_eval_seed < 0:
+        raise ValueError("--embracenet-eval-seed must be non-negative.")
     return args
 
 
@@ -672,6 +694,26 @@ class StaticGlobalWeightFusion(nn.Module):
         return fused, weights
 
 
+class EmbraceNetFusion(nn.Module):
+    """EmbraceNet bypass-docking selection on aligned [patch, encoder, channel].
+
+    Follows Choi and Lee, Information Fusion 51 (2019), 259-270, and the
+    official idearibosome/embracenet PyTorch implementation. Common projection
+    heads replace docking via its supported bypass_docking option. Each patch
+    and channel independently samples an encoder with uniform probability,
+    including in eval mode; selection probabilities are not learned gates.
+    """
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        if embeddings.ndim != 3 or any(size < 1 for size in embeddings.shape):
+            raise ValueError("EmbraceNet expects non-empty [N_patches, M_encoders, D].")
+        patches, encoders, dim = embeddings.shape
+        probabilities = embeddings.new_full((patches, encoders), 1.0 / encoders)
+        indices = torch.multinomial(probabilities, num_samples=dim, replacement=True)
+        # Gather is equivalent to official one-hot selection without allocating P*M*D masks.
+        return embeddings.gather(1, indices.unsqueeze(1)).squeeze(1)
+
+
 class SelfAttentionFusion(nn.Module):
     """Per-patch self-attention over encoder tokens followed by learned reduction."""
 
@@ -831,6 +873,11 @@ class ProjectedFusionABMIL(nn.Module):
         if method not in set(METHODS):
             raise ValueError(f"Unsupported projected fusion method: {method}")
         self.method = method
+        self.embracenet_eval_repeats = int(getattr(args, "embracenet_eval_repeats", 1))
+        self.embracenet_eval_seed = int(getattr(args, "embracenet_eval_seed", 1729))
+        if self.embracenet_eval_repeats < 1:
+            raise ValueError("EmbraceNet evaluation repeats must be positive.")
+        self.embracenet = EmbraceNetFusion() if method == "embracenet" else None
         self.encoder_names = sorted(input_dims.keys())
         self.projection_heads = MultiEncoderProjectionHead(
             input_dims={name: int(input_dims[name]) for name in self.encoder_names},
@@ -903,6 +950,8 @@ class ProjectedFusionABMIL(nn.Module):
             return self.cross_attention(torch.stack(tensors, dim=1))
         if self.method == "self_attention":
             return self.self_attention(torch.stack(tensors, dim=1))
+        if self.method == "embracenet":
+            return self.embracenet(torch.stack(tensors, dim=1))
         raise RuntimeError(f"Unknown method: {self.method}")
 
     def static_weights(self) -> torch.Tensor | None:
@@ -911,6 +960,17 @@ class ProjectedFusionABMIL(nn.Module):
         return torch.softmax(self.static_global.logits.detach(), dim=0)
 
     def forward(self, raw_features: Mapping[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.method == "embracenet" and not self.training and self.embracenet_eval_repeats > 1:
+            projected = self.projection_heads(raw_features)
+            embeddings = torch.stack([projected[name] for name in self.encoder_names], dim=1)
+            log_probabilities = []
+            for _ in range(self.embracenet_eval_repeats):
+                logits, attention = self.classifier(self.embracenet(embeddings))
+                log_probabilities.append(F.log_softmax(logits, dim=1))
+            # Returning normalized log probabilities preserves the usual softmax API.
+            averaged = torch.logsumexp(torch.stack(log_probabilities), dim=0)
+            averaged = averaged - np.log(self.embracenet_eval_repeats)
+            return averaged, attention
         return self.classifier(self.fuse(raw_features))
 
 
@@ -1109,6 +1169,19 @@ def train_one_epoch(model: nn.Module, dataset: MultiEncoderSlideDataset, optimiz
 
 @torch.no_grad()
 def evaluate(model: nn.Module, dataset: MultiEncoderSlideDataset, device: torch.device, decision_threshold: float) -> Tuple[EvalResult, pd.DataFrame]:
+    if getattr(model, "method", None) == "embracenet":
+        devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            torch.random.default_generator.manual_seed(model.embracenet_eval_seed)
+            if devices:
+                with torch.cuda.device(devices[0]):
+                    torch.cuda.manual_seed(model.embracenet_eval_seed)
+            return _evaluate_predictions(model, dataset, device, decision_threshold)
+    return _evaluate_predictions(model, dataset, device, decision_threshold)
+
+
+@torch.no_grad()
+def _evaluate_predictions(model: nn.Module, dataset: MultiEncoderSlideDataset, device: torch.device, decision_threshold: float) -> Tuple[EvalResult, pd.DataFrame]:
     model.eval()
     labels, probs, rows = [], [], []
     for idx in range(len(dataset)):

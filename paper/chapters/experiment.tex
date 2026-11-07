@@ -112,7 +112,7 @@ CoR-Fuse & $\mathbf{0.81 \pm 0.09}$ & $\mathbf{0.84 \pm 0.10}$ & $\mathbf{0.73 \
 To evaluate the contribution of each design component in CoR-Fuse, we conduct ablation studies on TCGA-UVM and TCGA-BLCA using the encoder composition: \{UNI, Virchow2, Midnight-12k, GigaPath, Phikon\} (Table~\ref{tab:ablation}).
 
 \textbf{Effect of Consensus Representation.}
-Removing the consensus component leaves the overall concentration of slide-level routing weights largely unchanged, with the mean Gini coefficient changing only from (Appendix~\ref{sec:ablation_study}). 
+Removing the consensus component leaves the overall concentration of slide-level routing weights largely unchanged, with the mean Gini coefficient changing slightly. (Appendix~\ref{sec:ablation_study}). 
 Nevertheless, it induces a modest redistribution of routing mass across foundation models: removing consensus decreases the mean weights assigned to Phikon and UNI, while increasing those assigned to Virchow2 and Midnight-12k. 
 Thus, consensus conditioning primarily affects encoder-level weight allocation, while having limited influence on the overall concentration of the routing distribution. 
 Thus, the consensus component primarily affects encoder-level weight allocation rather than the overall concentration of the routing distribution.
