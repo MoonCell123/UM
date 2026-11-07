@@ -65,13 +65,6 @@ CoR-Fuse & $0.84 \pm 0.01$ & $0.87 \pm 0.01$ & $0.75 \pm 0.02$ & $4.77$ & $52.35
     \end{tabular}
 \end{table}
 
-\begin{figure}[!ht]
-    \centering
-    \includegraphics[width=0.8\linewidth]{figs/um_fm/mean_abs_spearman_heatmap.pdf}
-    \caption{Mean absolute feature-level Spearman correlation $R_{ij}$ across the 13 pathology encoders on TCGA-UVM. The weak and compressed range of Spearman correlations, despite the broader CKA range, highlights that global geometric similarity and feature-level statistical correspondence capture different aspects of encoder relationships.}
-    \label{fig:all_Spearman_heatmap}
-\end{figure}
-
 \clearpage
 \section{Experiments on TCGA-UVM}
 
@@ -120,7 +113,7 @@ Method & AUC & AUPRC & F1\\
 Mean Fusion & $0.81 \pm 0.01$ & $\mathbf{0.84 \pm 0.02}$ & $0.72 \pm 0.02$\\
 Concatenation & $0.74 \pm 0.02$ & $0.77 \pm 0.03$ & $0.63 \pm 0.11$\\
 Global Weight & $0.81 \pm 0.00$ & $\mathbf{0.84 \pm 0.02}$ & $0.72 \pm 0.02$ \\
-Gated Fusion & $0.81 \pm 0.03$ & $0.82 \pm 0.05$ & $\mathbf{0.74 \pm 0.04}$\\
+Gated Fusion & $0.81 \pm 0.03$ & $0.82 \pm 0.05$ & $0.74 \pm 0.04$\\
 Cross Attention & $0.79 \pm 0.02$ & $0.83 \pm 0.02$ & $0.68 \pm 0.05$ \\
 ELF & $0.80 \pm 0.02$ & $0.83 \pm 0.03$ & $\mathbf{0.74 \pm 0.02}$ \\
 CoR-Fuse & $\mathbf{0.82 \pm 0.04}$ & $0.83 \pm 0.02$ & $0.73 \pm 0.03$ \\
@@ -201,7 +194,7 @@ CoR-Fuse & $0.83 \pm 0.11$ & $0.87 \pm 0.11$ & $0.74 \pm 0.17$ \\
 
 \begin{table}[htbp]
 \centering
-\caption{Fusion performance under an intermediate-similarity five-encoder composition on TCGA-UVM.}
+\caption{Fusion performance under an intermediate-similarity five-encoder composition \{H-optimus-1, H-optimus-0, Virchow2, UNI-v2, CONCH-v1.5\} on TCGA-UVM.}
 \label{tab:uvm_n5_balanced_group}
 \begin{tabular}{lccccc}
 \toprule
@@ -272,14 +265,6 @@ $0.750 $ & $0.682$ & $0.730$ \\
     \caption{Pairwise CKA versus mean absolute task-level interaction $|I_{ij}|$ for the five-encoder composition on TCGA-BLCA. Each point represents a pair of foundation models, with CKA measuring representational similarity and $|I_{ij}|$ measuring the magnitude of their task-level interaction.}
     \label{fig:blca_quadrants}
 \end{figure}
-
-\begin{figure}[!ht]
-    \centering
-    \includegraphics[width=0.8\linewidth]{figs/blca/mean_abs_spearman_heatmap.pdf}
-    \caption{Mean absolute feature-level Spearman correlation for five-encoder composition on TCGA-BLCA. Each entry summarizes the mean absolute Spearman correlation between a pair of encoder representations at the feature level.}
-    \label{fig:blca_heatmap}
-\end{figure}
-
 
 \clearpage
 \section{Implementation Details}
