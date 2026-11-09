@@ -3,16 +3,17 @@
 Baselines implemented here:
 
 1. no_fusion       : train ABMIL on one encoder at a time.
-2. mean            : per-encoder ProjectionHead -> mean over encoders -> ABMIL.
-3. concat          : per-encoder ProjectionHead -> concat -> linear reduction -> ABMIL.
-4. gated           : WSI-level learned encoder gates -> weighted sum -> ABMIL.
-5. static_global_weight: train-set learned global encoder weights shared by every WSI -> ABMIL.
-6. cross_attention : per-encoder ProjectionHead -> encoder-token cross attention -> ABMIL.
-7. self_attention  : per-encoder ProjectionHead -> encoder-token self attention -> ABMIL.
-8. meta_encoder     : raw per-patch concatenation -> patch-token self attention -> ABMIL.
-9. fusecpath        : multi-view representative selection -> clustered local/cross-cluster
+2. multi_fm_abmil   : concatenate all encoder features per patch -> one ABMIL.
+3. mean            : per-encoder ProjectionHead -> mean over encoders -> ABMIL.
+4. concat          : per-encoder ProjectionHead -> concat -> linear reduction -> ABMIL.
+5. gated           : WSI-level learned encoder gates -> weighted sum -> ABMIL.
+6. static_global_weight: train-set learned global encoder weights shared by every WSI -> ABMIL.
+7. cross_attention : per-encoder ProjectionHead -> encoder-token cross attention -> ABMIL.
+8. self_attention  : per-encoder ProjectionHead -> encoder-token self attention -> ABMIL.
+9. meta_encoder     : raw per-patch concatenation -> patch-token self attention -> ABMIL.
+10. fusecpath       : multi-view representative selection -> clustered local/cross-cluster
                        re-embedding -> ABMIL (FuseCPath patch branch).
-10. embracenet     : shared projection interface -> stochastic per-patch/channel
+11. embracenet      : shared projection interface -> stochastic per-patch/channel
                        modality selection (official bypass-docking semantics) -> ABMIL.
 
 These are conventional baselines for comparing against train_gme.py. They do
@@ -75,6 +76,7 @@ DEFAULT_FEATURE_DIRS = [
 ]
 FEATURE_KEYS = ("feats", "features")
 METHODS = (
+    "multi_fm_abmil",
     "mean",
     "concat",
     "cross_attention",
@@ -584,6 +586,47 @@ class SingleEncoderABMIL(nn.Module):
 
     def forward(self, raw_features: Mapping[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.classifier(raw_features[self.encoder_name])
+
+
+class MultiEncoderABMIL(nn.Module):
+    """Concatenate all encoder features per patch and train one shared ABMIL."""
+
+    def __init__(self, input_dims: Mapping[str, int], args: argparse.Namespace):
+        super().__init__()
+        if not input_dims:
+            raise ValueError("multi_fm_abmil requires at least one encoder.")
+        self.encoder_names = sorted(input_dims.keys())
+        self.input_dims = {name: int(input_dims[name]) for name in self.encoder_names}
+        self.input_dim = int(sum(self.input_dims.values()))
+        self.classifier = ABMIL_Cls(
+            D_feat=self.input_dim,
+            D_inner=args.d_inner,
+            D_attn=args.d_attn,
+            n_classes=args.n_classes,
+            droprate=args.droprate,
+        )
+
+    def forward(self, raw_features: Mapping[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        tensors = []
+        patch_count = None
+        for encoder_name in self.encoder_names:
+            if encoder_name not in raw_features:
+                raise KeyError(f"Missing encoder {encoder_name}; got {list(raw_features)}")
+            tensor = raw_features[encoder_name]
+            expected_dim = self.input_dims[encoder_name]
+            if tensor.ndim != 2 or tensor.shape[-1] != expected_dim:
+                raise ValueError(
+                    f"{encoder_name}: expected [N, {expected_dim}], got {tuple(tensor.shape)}"
+                )
+            if patch_count is None:
+                patch_count = tensor.shape[0]
+            elif tensor.shape[0] != patch_count:
+                raise ValueError(
+                    "multi_fm_abmil requires aligned patch counts across encoders; "
+                    f"got {patch_count} and {tensor.shape[0]}."
+                )
+            tensors.append(tensor.float())
+        return self.classifier(torch.cat(tensors, dim=-1))
 
 
 class CrossAttentionFusion(nn.Module):
@@ -1294,6 +1337,8 @@ def train_fold(
             raise ValueError("no_fusion expects exactly one encoder.")
         encoder_name = next(iter(input_dims.keys()))
         model = SingleEncoderABMIL(encoder_name, int(input_dims[encoder_name]), args).to(device)
+    elif method == "multi_fm_abmil":
+        model = MultiEncoderABMIL(input_dims, args).to(device)
     elif method == "meta_encoder":
         model = MetaEncoderSelfAttentionABMIL(input_dims, args).to(device)
     elif method == "fusecpath":
