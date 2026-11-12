@@ -3,3 +3,5 @@ __pycache__/
 idea.md
 output/
 dataset/BLCA/
+tests/
+tmp/

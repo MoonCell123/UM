@@ -64,6 +64,7 @@ from data_utils.cohort import load_experiment_data, resolve_cohort_spec
 from data_utils.fusecpath_dataset import FuseCPathSlideDataset
 from modules.beacon import infer_input_dims
 from utils.output_guard import allocate_run_dir, prepare_explicit_run_dir
+from utils.gpu_memory import measure_peak_gpu_memory
 
 
 DEFAULT_MANIFEST = PROJECT_ROOT / "output" / "Manifests" / "Manifests_seed35" / "fusion_manifest.csv"
@@ -1141,7 +1142,7 @@ def profile_offline_efficiency(
     profile_repeat: int,
 ) -> Dict[str, float]:
     parameters = count_parameters(model)
-    raw_samples = collect_profile_inputs(dataset, device, profile_samples)
+    raw_samples = collect_profile_inputs(dataset, torch.device("cpu"), profile_samples)
     encoder_names = (
         list(model.encoder_names)
         if hasattr(model, "encoder_names")
@@ -1149,12 +1150,15 @@ def profile_offline_efficiency(
     )
     profile_inputs = profile_sample_tuples(raw_samples, encoder_names)
     wrapper = OfflineProfileWrapper(model, encoder_names).to(device)
+    memory = measure_peak_gpu_memory(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
+    profile_inputs = [tuple(tensor.to(device) for tensor in sample) for sample in profile_inputs]
     flops = estimate_fvcore_flops(wrapper, profile_inputs)
     inference_time = measure_forward_time_seconds(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
     return {
         "parameters": round(float(parameters) / 1_000_000.0, 2),
         "flops": round(float(flops) / 1_000_000_000.0, 2),
         "inference_time": round(float(inference_time) * 1000.0, 3),
+        **memory,
     }
 
 
@@ -1536,7 +1540,8 @@ def summarize(fold_rows: List[Mapping[str, object]], output_dir: Path) -> None:
         return
 
     group_cols = ["method", "model_name", "encoders"]
-    metric_cols = ["auc", "auprc", "accuracy", "f1", "precision", "recall", "parameters", "flops", "inference_time"]
+    metric_cols = ["auc", "auprc", "accuracy", "f1", "precision", "recall", "parameters", "flops", "inference_time",
+                   "peak_gpu_memory", "peak_gpu_memory_max"]
     summary_rows = []
     for keys, group in fold_df.groupby(group_cols, dropna=False):
         key_values = keys if isinstance(keys, tuple) else (keys,)

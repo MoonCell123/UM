@@ -799,7 +799,8 @@ def summarize_metrics(fold_rows: List[Mapping[str, object]], output_dir: Path) -
     fold_df.to_csv(output_dir / "fold_metrics.csv", index=False, encoding="utf-8-sig", float_format="%.6f")
 
     summary_rows = []
-    for metric in ["auc", "auprc", "accuracy", "f1", "precision", "recall", "parameters", "flops", "inference_time"]:
+    for metric in ["auc", "auprc", "accuracy", "f1", "precision", "recall", "parameters", "flops", "inference_time",
+                   "peak_gpu_memory", "peak_gpu_memory_max"]:
         values = pd.to_numeric(fold_df[metric], errors="coerce")
         if values.notna().sum() == 0:
             summary_rows.append({
