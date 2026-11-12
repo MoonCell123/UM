@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from architecture.gme_model import GMEModel
 from data_utils.gme_dataset import MultiEncoderSlideDataset
+from utils.gpu_memory import measure_peak_gpu_memory
 
 
 def move_features(features: Mapping[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -168,7 +169,7 @@ def profile_gme_efficiency(
     use_student_router: bool = False,
 ) -> Dict[str, float]:
     parameters = count_parameters(model)
-    raw_samples = collect_profile_inputs(dataset, device, profile_samples)
+    raw_samples = collect_profile_inputs(dataset, torch.device("cpu"), profile_samples)
     # Attribution is an offline preprocessing product and is deliberately
     # computed before FLOPs/timing.  The reported inference_time measures the
     # same online boundary as fusion baselines: projection + fusion/router +
@@ -179,7 +180,7 @@ def profile_gme_efficiency(
         offline_scores = []
         if not use_student_router:
             for raw_features in raw_samples:
-                projected = model.project(raw_features)
+                projected = model.project(move_features(raw_features, device))
                 routing_scores, _, _ = model.intervention_attribution(
                     projected=projected,
                     baselines=baselines,
@@ -187,7 +188,7 @@ def profile_gme_efficiency(
                     gaussian_std_scale=gaussian_std_scale,
                     compute_interactions=False,
                 )
-                offline_scores.append(routing_scores.detach())
+                offline_scores.append(routing_scores.detach().cpu())
     model.train(was_training)
     profile_inputs = (
         profile_sample_tuples(raw_samples, model.encoder_names)
@@ -197,12 +198,15 @@ def profile_gme_efficiency(
     wrapper = GMEProfileWrapper(
         model, model.encoder_names, use_student_router=use_student_router
     ).to(device)
+    memory = measure_peak_gpu_memory(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
+    profile_inputs = [tuple(tensor.to(device) for tensor in sample) for sample in profile_inputs]
     flops = estimate_fvcore_flops(wrapper, profile_inputs)
     inference_time = measure_forward_time_seconds(wrapper, profile_inputs, device, profile_warmup, profile_repeat)
     return {
         "parameters": round(float(parameters) / 1_000_000.0, 2),
         "flops": round(float(flops) / 1_000_000_000.0, 2),
         "inference_time": round(float(inference_time) * 1000.0, 3),
+        **memory,
     }
 
 
