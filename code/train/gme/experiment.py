@@ -898,10 +898,16 @@ def run_fold(
         ),
         student_router_temperature=args.student_router_temperature,
         student_router_use_consensus=args.student_router_use_consensus,
+        student_router_consensus_mode=args.student_router_consensus_mode,
+        student_router_consensus_heads=args.student_router_consensus_heads,
     ).to(device)
 
     print(f"\nFold {fold}: train={len(train_ds)}, val={len(val_ds)}, encoders={train_ds.encoder_names}")
     print(f"Input dims: {input_dims}")
+    if use_teacher_student:
+        print("Student consensus: " + (
+            args.student_router_consensus_mode if args.student_router_use_consensus else "disabled"
+        ))
 
     baseline_ds = MultiEncoderSlideDataset(
         manifest=manifest,

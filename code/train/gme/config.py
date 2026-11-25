@@ -240,6 +240,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--student-router-consensus-mode", choices=["mean", "learnable"], default="mean",
+        help="Student consensus: encoder mean or learned-query cross-attention over slide descriptors.",
+    )
+    parser.add_argument(
+        "--student-router-consensus-heads", type=int, default=4,
+        help="Attention heads for learnable consensus; must divide target_dim.",
+    )
+    parser.add_argument(
         "--teacher-freeze-projection",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -303,6 +311,14 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--student-router-hidden-dim must be at least 1.")
     if float(args.student_router_temperature) <= 0.0:
         raise ValueError("--student-router-temperature must be positive.")
+    if args.student_router_consensus_mode not in {"mean", "learnable"}:
+        raise ValueError("student_router_consensus_mode must be mean or learnable.")
+    if args.student_router_consensus_heads < 1:
+        raise ValueError("student_router_consensus_heads must be positive.")
+    if (args.routing_mode == "teacher_student" and args.student_router_use_consensus
+            and args.student_router_consensus_mode == "learnable"
+            and args.target_dim % args.student_router_consensus_heads):
+        raise ValueError("target_dim must be divisible by student_router_consensus_heads.")
     if int(args.mlp_hidden_dim) < 1:
         raise ValueError("--mlp-hidden-dim must be at least 1.")
     if int(args.gnn_hidden_dim) < 1:

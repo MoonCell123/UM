@@ -1,15 +1,16 @@
 # Config for code/train/train_gme.py
 
-manifest: "output/Manifests/Manifests_seed42/fusion_manifest.csv"
+manifest: "output/Manifests/BLCA_seed42/fusion_manifest.csv"
 build_manifest: false
 feat_base: "Q:/TCGA-BLCA-features/20x_256px_0px_overlap"
 feature_dirs:
-  - "features_gigapath"
-  - "features_midnight12k"
-  - "features_virchow2"
-  - "features_phikon"
   - "features_uni_v1"
-manifest_dir: "output/Manifests/Manifests_seed42"
+  - "features_conch_v15"
+  # - "features_gigapath"
+  # - "features_virchow2"
+  # - "features_hoptimus0"
+  
+manifest_dir: "output/Manifests/BLCA_seed42"
 cv_folds: 5
 
 clinical_path: "G:/Fanglun/Project/UM/dataset/BLCA/task.csv"
@@ -19,7 +20,7 @@ workflow_mode: "fusion_only"  # fusion_only | analysis_only | fusion_and_analysi
 analysis_source_run_dir: null            # analysis_only need fusion result dir
 folds: null     
 training_protocol: "fixed_split_no_refit"  # nested_refit or fixed_split_no_refit; use folds: [1] to train once
-seed: 42     # seed 42 35 2026
+seed: 42     # seed 42 2026 2027
 device: "cuda"
 gpu_id: 1
 
@@ -38,23 +39,14 @@ lr_stage2: 0.0001
 weight_decay: 0.001
 grad_clip: 5.0
 
-replacement_strategy: "mean"    # embedding mask way
-gaussian_std_scale: 1.0
-attribution_target: "predicted_class"
-
 routing_mode: "teacher_student"  # online_attribution or teacher_student
 teacher_epochs: 100
 teacher_patience: 5
 teacher_lr: 0.0001
 mean_fusion_warm_start: true    # false for ablation
-teacher_distill_weight: 0.0       # 0 skips teacher LOO targets/baselines and KL lookup
-teacher_kl_loss_ratio: 0.0       # Maximum weighted KL / CE loss per sample; 0 disables the cap; 0.1
-teacher_target_temperature: 1.0
-teacher_target_clip: 3.0
-student_router_hidden_dim: 64
-student_router_temperature: 1.0
-student_router_use_consensus: false   # false for ablation
-teacher_freeze_projection: true
+student_router_use_consensus: true   # false disables consensus in both modes
+student_router_consensus_mode: "mean"  # mean | learnable
+teacher_freeze_projection: false
 
 max_patches: 0
 eval_max_patches: 0

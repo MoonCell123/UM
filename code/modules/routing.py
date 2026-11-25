@@ -237,6 +237,31 @@ class DualConsistencyRouter(nn.Module):
         )
 
 
+class LearnableConsensus(nn.Module):
+    """One learned query attends to all encoder slide descriptors [M, D]."""
+
+    def __init__(self, dim: int, heads: int = 4):
+        super().__init__()
+        if dim <= 0 or heads <= 0 or dim % heads:
+            raise ValueError("Consensus dim must be positive and divisible by positive heads.")
+        self.query = nn.Parameter(torch.empty(1, 1, dim))
+        nn.init.normal_(self.query, std=0.02)
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=0.0, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+
+    def forward(self, means: torch.Tensor) -> torch.Tensor:
+        if means.ndim != 2 or means.shape[0] < 1 or means.shape[1] != self.query.shape[-1]:
+            raise ValueError("LearnableConsensus expects non-empty [M_encoders, feature_dim].")
+        tokens = self.norm_kv(means.unsqueeze(0))  # [1, M, D]
+        attended, _ = self.attn(self.norm_q(self.query), tokens, tokens, need_weights=False)
+        consensus = self.query + attended
+        consensus = consensus + self.ffn(self.norm2(consensus))
+        return consensus.squeeze(0)  # [1, D], shared context for all encoders
+
+
 class EmbeddingStudentRouter(nn.Module):
     """Predict encoder fusion weights directly from projected slide embeddings.
 
@@ -253,6 +278,8 @@ class EmbeddingStudentRouter(nn.Module):
         temperature: float = 1.0,
         dropout: float = 0.0,
         use_consensus: bool = True,
+        consensus_mode: str = "mean",
+        consensus_heads: int = 4,
     ):
         super().__init__()
         if not encoder_names:
@@ -264,6 +291,9 @@ class EmbeddingStudentRouter(nn.Module):
         self.encoder_names = list(encoder_names)
         self.temperature = float(temperature)
         self.use_consensus = bool(use_consensus)
+        if consensus_mode not in {"mean", "learnable"}:
+            raise ValueError(f"Unsupported student consensus mode: {consensus_mode}")
+        self.consensus_mode = consensus_mode
         router_input_dim = int(feature_dim) * (2 if self.use_consensus else 1)
         self.score_net = nn.Sequential(
             nn.LayerNorm(router_input_dim),
@@ -273,6 +303,12 @@ class EmbeddingStudentRouter(nn.Module):
             nn.Linear(int(hidden_dim), 1),
         )
         self.encoder_bias = nn.Parameter(torch.zeros(len(self.encoder_names)))
+        self.consensus_net = None
+        if self.use_consensus and consensus_mode == "learnable":
+            # Do not shift downstream classifier initialization when switching
+            # consensus mode under the same experiment seed. Modules start on CPU.
+            with torch.random.fork_rng(devices=[]):
+                self.consensus_net = LearnableConsensus(int(feature_dim), heads=consensus_heads)
 
     def _slide_means(self, features_by_encoder: TensorDict) -> torch.Tensor:
         means = []
@@ -286,7 +322,11 @@ class EmbeddingStudentRouter(nn.Module):
     def forward(self, features_by_encoder: TensorDict) -> RoutingOutput:
         means = self._slide_means(features_by_encoder)
         if self.use_consensus:
-            consensus = means.mean(dim=0, keepdim=True).expand_as(means)
+            consensus = (
+                self.consensus_net(means)
+                if self.consensus_net is not None
+                else means.mean(dim=0, keepdim=True)
+            ).expand_as(means)
             router_input = torch.cat([means, consensus], dim=-1)
         else:
             router_input = means

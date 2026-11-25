@@ -48,6 +48,8 @@ class GMEModel(nn.Module):
         student_router_hidden_dim: int = 0,
         student_router_temperature: float = 1.0,
         student_router_use_consensus: bool = True,
+        student_router_consensus_mode: str = "mean",
+        student_router_consensus_heads: int = 4,
     ):
         super().__init__()
         self.encoder_names = sorted(input_dims.keys())
@@ -68,6 +70,8 @@ class GMEModel(nn.Module):
                 hidden_dim=student_router_hidden_dim,
                 temperature=student_router_temperature,
                 use_consensus=student_router_use_consensus,
+                consensus_mode=student_router_consensus_mode,
+                consensus_heads=student_router_consensus_heads,
             )
             if student_router_hidden_dim > 0
             else None

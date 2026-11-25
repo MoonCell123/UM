@@ -165,6 +165,8 @@ def build_model(run_config: Mapping[str, object], checkpoint_payload: Mapping[st
         ),
         student_router_temperature=float(run_config.get("student_router_temperature", 1.0)),
         student_router_use_consensus=bool(run_config.get("student_router_use_consensus", True)),
+        student_router_consensus_mode=str(run_config.get("student_router_consensus_mode", "mean")),
+        student_router_consensus_heads=int(run_config.get("student_router_consensus_heads", 4)),
     ).to(device)
     state_dict = checkpoint_payload.get("state_dict")
     if not isinstance(state_dict, dict):
